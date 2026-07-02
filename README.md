@@ -1,6 +1,6 @@
 # iwork-mcp
 
-MCP server for Apple iWork automation — 113 tools for Numbers, Pages, and Keynote.
+MCP server for Apple iWork automation — 117 tools for Numbers, Pages, and Keynote.
 
 One line to install. Works with Claude Desktop, Claude Code, Codex, and any MCP client.
 
@@ -137,7 +137,7 @@ codex mcp add iwork -- npx -y iwork-mcp
 | `numbers_super_resolution` | AI image upscaling — increase resolution while preserving quality (Creator Studio) |
 | `numbers_remove_background` | AI background removal from images (Creator Studio) |
 
-### Pages (22 tools)
+### Pages (26 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -159,6 +159,10 @@ codex mcp add iwork -- npx -y iwork-mcp
 | `pages_format_text` | Set font, size, color, bold, italic on a paragraph |
 | `pages_add_image` | Insert an image |
 | `pages_add_table` | Insert a table |
+| `pages_list_tables` | List tables with size and header configuration |
+| `pages_read_table` | Read all cell values and formulas from a table |
+| `pages_write_table_cells` | Write cell values; `=` strings set formulas, existing formulas recalculate |
+| `pages_resize_table` | Change a table's row/column count |
 | `pages_insert_page_break` | Insert a page break between paragraphs |
 | `pages_create_document_with_content` | Create a document with multiple formatted paragraphs in one fast call |
 | `pages_super_resolution` | AI image upscaling — increase resolution while preserving quality (Creator Studio) |

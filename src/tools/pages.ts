@@ -503,6 +503,172 @@ export function registerPagesTools(server: McpServer): void {
     `, { documentName, rows: rows ?? null, columns: columns ?? null })),
   );
 
+  // ── Table Cell Tools (AppleScript bridge) ──
+  // Pages tables are unreachable via JXA (-2763 TMAScriptTableInfoProxy), but the
+  // AppleScript dictionary exposes them fully — same workaround as the Keynote
+  // master-slide tools: run AppleScript through NSAppleScript from within JXA.
+
+  const PAGES_TABLE_HELPERS = `
+    ObjC.import("Foundation");
+    function osType(s) { let n = 0; for (let i = 0; i < 4; i++) n = n * 256 + s.charCodeAt(i); return n; }
+    function runAS(src) {
+      const script = $.NSAppleScript.alloc.initWithSource(src);
+      const err = $();
+      const result = script.executeAndReturnError(err);
+      if (!result || (result.isNil && result.isNil())) {
+        const errInfo = ObjC.deepUnwrap(err) || {};
+        throw new Error(errInfo.NSAppleScriptErrorBriefMessage || errInfo.NSAppleScriptErrorMessage || "AppleScript execution failed");
+      }
+      return result;
+    }
+    function descToJS(d) {
+      const t = d.descriptorType;
+      if (t === osType("msng")) return null;
+      if (t === osType("doub")) return d.doubleValue;
+      if (t === osType("long")) return d.int32Value;
+      if (t === osType("bool")) return d.booleanValue;
+      if (t === osType("true")) return true;
+      if (t === osType("fals")) return false;
+      if (t === osType("list")) {
+        const arr = [];
+        for (let i = 1; i <= d.numberOfItems; i++) arr.push(descToJS(d.descriptorAtIndex(i)));
+        return arr;
+      }
+      const s = d.stringValue;
+      return (s && !s.isNil()) ? s.js : null;
+    }
+    function asQuote(s) {
+      return '"' + String(s).replace(/\\\\/g, "\\\\\\\\").replace(/"/g, '\\\\"').replace(/\\n/g, "\\\\n").replace(/\\r/g, "\\\\r").replace(/\\t/g, "\\\\t") + '"';
+    }
+    function asValue(v) {
+      if (v === null || v === undefined) return '""';
+      if (typeof v === "number") return String(v);
+      if (typeof v === "boolean") return v ? "true" : "false";
+      return asQuote(v);
+    }
+    function tableRef() {
+      return "table " + params.tableIndex + " of document " + asQuote(params.documentName);
+    }
+  `;
+
+  server.tool(
+    "pages_list_tables",
+    "List all tables in a Pages document with their name, size, and header configuration",
+    {
+      documentName: z.string().describe("Name of the open document"),
+    },
+    ANNOTATIONS.readOnly,
+    async ({ documentName }) => handleJXA(() => runJXA<string>(`
+      ${PAGES_TABLE_HELPERS}
+      const src = 'tell application "Pages"\\n' +
+        'tell document ' + asQuote(params.documentName) + '\\n' +
+        'set out to {}\\n' +
+        'repeat with t in tables\\n' +
+        'set end of out to {name of t, row count of t, column count of t, header row count of t, header column count of t}\\n' +
+        'end repeat\\n' +
+        'return out\\n' +
+        'end tell\\n' +
+        'end tell';
+      const list = descToJS(runAS(src)) || [];
+      return JSON.stringify(list.map(function (t, i) {
+        return { index: i + 1, name: t[0], rows: t[1], columns: t[2], headerRows: t[3], headerColumns: t[4] };
+      }));
+    `, { documentName })),
+  );
+
+  server.tool(
+    "pages_read_table",
+    "Read all cell values and formulas from a table in a Pages document (1-based table index; use pages_list_tables to see available tables)",
+    {
+      documentName: z.string().describe("Name of the open document"),
+      tableIndex: z.number().int().min(1).optional().describe("Table index, 1-based (default: 1)"),
+    },
+    ANNOTATIONS.readOnly,
+    async ({ documentName, tableIndex }) => handleJXA(() => runJXA<string>(`
+      ${PAGES_TABLE_HELPERS}
+      const src = 'tell application "Pages"\\n' +
+        'tell ' + tableRef() + '\\n' +
+        'set vals to {}\\n' +
+        'set fmls to {}\\n' +
+        'repeat with r from 1 to count of rows\\n' +
+        'set end of vals to (value of every cell of row r)\\n' +
+        'set end of fmls to (formula of every cell of row r)\\n' +
+        'end repeat\\n' +
+        'return {name, row count, column count, header row count, vals, fmls}\\n' +
+        'end tell\\n' +
+        'end tell';
+      const r = descToJS(runAS(src));
+      return JSON.stringify({ name: r[0], rows: r[1], columns: r[2], headerRows: r[3], values: r[4], formulas: r[5] });
+    `, { documentName, tableIndex: tableIndex ?? 1 })),
+  );
+
+  server.tool(
+    "pages_write_table_cells",
+    "Write values into table cells in a Pages document (1-based row/column). Strings starting with '=' become formulas (e.g. '=SUM(D2:D5)'). Existing formulas in other cells recalculate automatically. By default the table grows to fit out-of-range writes.",
+    {
+      documentName: z.string().describe("Name of the open document"),
+      tableIndex: z.number().int().min(1).optional().describe("Table index, 1-based (default: 1)"),
+      cells: z.array(z.object({
+        row: z.number().int().min(1).describe("Row number (1-based, header row is 1)"),
+        column: z.number().int().min(1).describe("Column number (1-based)"),
+        value: z.union([z.string(), z.number(), z.boolean(), z.null()]).describe("Cell value; string starting with '=' sets a formula; null clears the cell"),
+      })).min(1).describe("Cells to write"),
+      autoGrow: z.boolean().optional().describe("Grow the table if a write is beyond current bounds (default: true)"),
+    },
+    ANNOTATIONS.readWrite,
+    async ({ documentName, tableIndex, cells, autoGrow }) => handleJXA(() => runJXA<string>(`
+      ${PAGES_TABLE_HELPERS}
+      let maxRow = 0, maxCol = 0;
+      for (const c of params.cells) {
+        if (c.row > maxRow) maxRow = c.row;
+        if (c.column > maxCol) maxCol = c.column;
+      }
+      let body = '';
+      if (params.autoGrow) {
+        body += 'if row count < ' + maxRow + ' then set row count to ' + maxRow + '\\n';
+        body += 'if column count < ' + maxCol + ' then set column count to ' + maxCol + '\\n';
+      }
+      for (const c of params.cells) {
+        body += 'set value of cell ' + c.column + ' of row ' + c.row + ' to ' + asValue(c.value) + '\\n';
+      }
+      const src = 'tell application "Pages"\\n' +
+        'tell ' + tableRef() + '\\n' +
+        body +
+        'return {row count, column count}\\n' +
+        'end tell\\n' +
+        'end tell';
+      const dims = descToJS(runAS(src));
+      return JSON.stringify({ written: params.cells.length, rows: dims[0], columns: dims[1] });
+    `, { documentName, tableIndex: tableIndex ?? 1, cells, autoGrow: autoGrow ?? true })),
+  );
+
+  server.tool(
+    "pages_resize_table",
+    "Change the row and/or column count of a table in a Pages document. Shrinking deletes the content of removed rows/columns.",
+    {
+      documentName: z.string().describe("Name of the open document"),
+      tableIndex: z.number().int().min(1).optional().describe("Table index, 1-based (default: 1)"),
+      rows: z.number().int().min(1).optional().describe("New row count"),
+      columns: z.number().int().min(1).optional().describe("New column count"),
+    },
+    ANNOTATIONS.readWrite,
+    async ({ documentName, tableIndex, rows, columns }) => handleJXA(() => runJXA<string>(`
+      ${PAGES_TABLE_HELPERS}
+      let body = '';
+      if (params.rows) body += 'set row count to ' + params.rows + '\\n';
+      if (params.columns) body += 'set column count to ' + params.columns + '\\n';
+      if (!body) throw new Error("Provide rows and/or columns");
+      const src = 'tell application "Pages"\\n' +
+        'tell ' + tableRef() + '\\n' +
+        body +
+        'return {row count, column count}\\n' +
+        'end tell\\n' +
+        'end tell';
+      const dims = descToJS(runAS(src));
+      return JSON.stringify({ rows: dims[0], columns: dims[1] });
+    `, { documentName, tableIndex: tableIndex ?? 1, rows: rows ?? null, columns: columns ?? null })),
+  );
+
   // ── Page Break Tool ──
 
   server.tool(
