@@ -237,6 +237,100 @@ describe("Pages Integration", async () => {
     assert.ok(body.text.includes("Test Title"));
   });
 
+  // ── Table tools (AppleScript bridge) ──
+  // Table creation is broken on Creator Studio 15.x (-2763 TMAScriptTableInfoProxy,
+  // both JXA and AppleScript), so these tests use the built-in Invoice template,
+  // which ships with a table. Read/write/resize work on both 14.x and 15.x.
+
+  let tableDocName = "";
+
+  it("creates a document from an invoice template", async (t) => {
+    const { json: templates } = await call(ctx, "pages_list_templates");
+    const invoice = (templates as string[]).find((n) => n.toLowerCase().includes("invoice"));
+    if (!invoice) return t.skip("no invoice template available");
+    const { json } = await call(ctx, "pages_create_document", { templateName: invoice });
+    tableDocName = json.name;
+    assert.ok(tableDocName);
+  });
+
+  it("lists tables in the template document", async (t) => {
+    if (!tableDocName) return t.skip("no table document");
+    const { json } = await call(ctx, "pages_list_tables", { documentName: tableDocName });
+    assert.ok(Array.isArray(json));
+    assert.ok(json.length >= 1, "Invoice template should contain a table");
+    assert.ok(json[0].rows >= 2);
+    assert.ok(json[0].columns >= 2);
+  });
+
+  it("reads table values and formulas", async (t) => {
+    if (!tableDocName) return t.skip("no table document");
+    const { json } = await call(ctx, "pages_read_table", { documentName: tableDocName });
+    assert.ok(json.rows >= 2);
+    assert.ok(Array.isArray(json.values));
+    assert.equal(json.values.length, json.rows);
+    assert.ok(Array.isArray(json.formulas));
+  });
+
+  it("writes cells with escaping and typed round-trip", async (t) => {
+    if (!tableDocName) return t.skip("no table document");
+    const tricky = 'He said "hi" \\ there';
+    const { json } = await call(ctx, "pages_write_table_cells", {
+      documentName: tableDocName,
+      autoGrow: false,
+      cells: [
+        { row: 2, column: 1, value: tricky },
+        { row: 2, column: 2, value: 3 },
+      ],
+    });
+    assert.equal(json.written, 2);
+
+    const { json: table } = await call(ctx, "pages_read_table", { documentName: tableDocName });
+    assert.equal(table.values[1][0], tricky, "quotes/backslashes should round-trip");
+    assert.equal(table.values[1][1], 3, "numbers should round-trip typed");
+  });
+
+  it("writes a formula that evaluates", async (t) => {
+    if (!tableDocName) return t.skip("no table document");
+    const { isError } = await call(ctx, "pages_write_table_cells", {
+      documentName: tableDocName,
+      autoGrow: false,
+      cells: [{ row: 2, column: 3, value: "=B2*2" }],
+    });
+    assert.ok(!isError);
+
+    const { json: table } = await call(ctx, "pages_read_table", { documentName: tableDocName });
+    assert.equal(table.values[1][2], 6, "=B2*2 should evaluate to 6");
+    assert.ok(typeof table.formulas[1][2] === "string", "formula text should be readable");
+  });
+
+  it("resizes the table and returns errors for bad input", async (t) => {
+    if (!tableDocName) return t.skip("no table document");
+    const { json: before } = await call(ctx, "pages_read_table", { documentName: tableDocName });
+    const { json: grown } = await call(ctx, "pages_resize_table", {
+      documentName: tableDocName,
+      rows: before.rows + 2,
+    });
+    assert.equal(grown.rows, before.rows + 2);
+    const { json: shrunk } = await call(ctx, "pages_resize_table", {
+      documentName: tableDocName,
+      rows: before.rows,
+    });
+    assert.equal(shrunk.rows, before.rows);
+
+    const bad = await call(ctx, "pages_read_table", { documentName: tableDocName, tableIndex: 99 });
+    assert.equal(bad.isError, true, "bad tableIndex should return isError");
+  });
+
+  it("closes the table document without saving", async (t) => {
+    if (!tableDocName) return t.skip("no table document");
+    const { json } = await call(ctx, "pages_close_document", {
+      documentName: tableDocName,
+      saving: "no",
+    });
+    assert.ok(json.closed);
+    tableDocName = "";
+  });
+
   // ── Error on invalid document ──
 
   it("returns isError for a nonexistent document", async () => {

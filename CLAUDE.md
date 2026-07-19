@@ -40,7 +40,7 @@
 - **Creator Studio document name resolution**: Auto-save renames documents by appending file extensions (e.g. "Untitled 1" -> "Untitled 1.numbers"). `injectDocumentNameResolution()` in `src/jxa.ts` handles this transparently by trying the extended name on lookup failure.
 - **Keynote shape position**: Setting `shape.position = [x, y]` (array format) silently fails — reads back as (0,0). Must use object format: `shape.position = {x: x, y: y}`. Width/height setting works fine with direct assignment.
 - **JXA `indexOf()` on scriptable objects**: `doc.sheets().indexOf(sheet)` returns -1 because JXA object references can't be compared with `===`. Iterate by name instead.
-- **Pages tables inaccessible via JXA**: `doc.tables()` throws -2763 "Don't know how to create TMAScriptTableInfoProxy" — but the AppleScript dictionary exposes them fully. The four pages table tools (list/read/write_cells/resize) use the NSAppleScript bridge, same as Keynote master-slide ops. Cell writes with strings starting "=" set formulas; `set row count` grows/shrinks tables.
+- **Pages tables inaccessible via JXA**: `doc.tables()` throws -2763 "Don't know how to create TMAScriptTableInfoProxy" — but the AppleScript dictionary exposes them fully. The four pages table tools (list/read/write_cells/resize) use the NSAppleScript bridge, same as Keynote master-slide ops. Cell writes with strings starting "=" set formulas; `set row count` grows/shrinks tables. CAVEAT: table CREATION (`make new table`) is broken on Creator Studio 15.x in BOTH JXA and AppleScript (-2763), so on 15.x these tools only work with existing tables (e.g. from the Invoice template); `pages_add_table` works on 14.x only.
 - **Keynote text colors**: Use 0-1 float range (like Pages), NOT 0-65535 int range (like Numbers). `paragraph.color = [r/255, g/255, b/255]`.
 - **Numbers auto-parses formatted strings**: Writing `"$1,234.56"` to a cell auto-converts to numeric 1234.56. To preserve strings, set `cell.format = "text"` before writing.
 
@@ -62,7 +62,7 @@
 - `npm run test:integration` — CRUD tests for Numbers/Pages/Keynote, ~8s, needs apps
 - `npm run test:all` — both tiers combined
 - Uses `node:test` + `tsx`, in-memory MCP transport (no subprocess)
-- 95 tests total: 34 unit + 61 integration
+- 102 tests total: 34 unit + 68 integration
 
 ## Build & Publish
 - `npm run build` -> `tsc && chmod +x dist/index.js`
@@ -73,6 +73,6 @@
 
 ## Known Issues
 - All 6 Pages text tools (pages_add_text, pages_get_paragraphs, pages_format_text, pages_insert_text_at, pages_delete_text, pages_replace_text) work via `doc.bodyText.paragraphs` workarounds. The original `doc.paragraphs` API remains broken on Pages 14.5.
-- Pages tables are not accessible via JXA (-2763) but ARE via AppleScript: pages_list_tables, pages_read_table, pages_write_table_cells, and pages_resize_table use the NSAppleScript bridge.
+- Pages tables are not accessible via JXA (-2763) but ARE via AppleScript: pages_list_tables, pages_read_table, pages_write_table_cells, and pages_resize_table use the NSAppleScript bridge. On Creator Studio 15.x, table creation is broken in both JXA and AppleScript — pages_add_table only works on 14.x; the table tools work everywhere against existing tables.
 - Keynote shape fill/border colors are not exposed by JXA. Only opacity, rotation, and text formatting are settable via `keynote_format_shape`.
 - Pages paragraph styles (Title, Heading 1, Body, etc.) are NOT exposed by Apple's scripting dictionary. Only font, size, and color are accessible. No alignment, indent, or line spacing either.
