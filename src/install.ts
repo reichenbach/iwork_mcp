@@ -52,5 +52,5 @@ export function install(): void {
   console.log(wasPresent ? "\niwork-mcp config repaired!\n" : "\niwork-mcp installed successfully!\n");
   console.log("Make sure Numbers, Pages, and Keynote are installed (free from the App Store).");
   console.log("Restart Claude Desktop to activate (Cmd+Q, then reopen).");
-  console.log("113 tools for Numbers, Pages, and Keynote — ready to go.");
+  console.log("117 tools for Numbers, Pages, and Keynote — ready to go.");
 }
