@@ -80,6 +80,19 @@ codex mcp add iwork -- npx -y iwork-mcp
 
 > Create a 2026 calendar in Numbers with a sheet for each month, colored headers, and weekend highlighting.
 
+### Python MCP client
+
+[`examples/agent_call.py`](examples/agent_call.py) is a small runnable client that uses the official [`mcp`](https://pypi.org/project/mcp/) Python package to launch this server over stdio, list its tools, and call two read-only tools.
+
+Prerequisites: Python 3.10+, Node.js 18+, Numbers and Keynote, and a built server. From the repository root:
+
+```bash
+npm install
+npm run build
+python -m pip install mcp
+python examples/agent_call.py
+```
+
 ## Tools
 
 ### Numbers (50 tools)
