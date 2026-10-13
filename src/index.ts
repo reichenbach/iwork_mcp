@@ -7,6 +7,9 @@ import { stdin, stdout } from "node:process";
 
 const args = process.argv.slice(2);
 
+function trimPastedLineEndings(value: string): string { return value.replace(/[\r\n]+$/, ""); }
+function isLoopbackHostname(hostname: string): boolean { return ["127.0.0.1", "localhost", "[::1]"].includes(hostname.toLowerCase()); }
+
 function valueAfter(flag: string): string | undefined {
   const index = args.indexOf(flag);
   return index >= 0 ? args[index + 1] : undefined;
@@ -27,16 +30,19 @@ async function hiddenPrompt(label: string): Promise<string> {
     };
     const onData = (chunk: Buffer): void => {
       const input = chunk.toString("utf8");
-      if (input === "\u0003") {
-        cleanup();
-        reject(new Error("Passphrase setup cancelled"));
-      } else if (input === "\r" || input === "\n") {
-        cleanup();
-        resolve(value);
-      } else if (input === "\u007f") {
-        value = value.slice(0, -1);
-      } else if (!input.includes("\u0000")) {
-        value += input;
+      for (const character of input) {
+        if (character === "\u0003") {
+          cleanup();
+          reject(new Error("Passphrase setup cancelled"));
+          return;
+        }
+        if (character === "\r" || character === "\n") {
+          cleanup();
+          resolve(trimPastedLineEndings(value));
+          return;
+        }
+        if (character === "\u007f") value = value.slice(0, -1);
+        else if (character !== "\u0000") value += character;
       }
     };
     stdin.on("data", onData);
@@ -51,10 +57,10 @@ if (args[0] === "install") {
   const configDir = process.env.IWORK_MCP_CONFIG_DIR ?? join(homedir(), ".config", "iwork-mcp");
   let passphrase = process.env.IWORK_MCP_PASSPHRASE;
   if (!passphrase) {
-    passphrase = await hiddenPrompt("New owner passphrase (12+ characters): ");
-    const confirmation = await hiddenPrompt("Confirm passphrase: ");
+    passphrase = trimPastedLineEndings(await hiddenPrompt("New owner passphrase (12+ characters): "));
+    const confirmation = trimPastedLineEndings(await hiddenPrompt("Confirm passphrase: "));
     if (passphrase !== confirmation) throw new Error("Passphrases do not match");
-  }
+  } else passphrase = trimPastedLineEndings(passphrase);
   await savePassphrase(configDir, passphrase);
   console.error("Owner passphrase saved securely.");
 } else if (args.includes("--http")) {
@@ -64,6 +70,7 @@ if (args[0] === "install") {
   const publicUrl = process.env.IWORK_MCP_PUBLIC_URL ?? `http://${host}:${port}`;
   const parsedPublicUrl = new URL(publicUrl);
   if (parsedPublicUrl.pathname !== "/" || parsedPublicUrl.search || parsedPublicUrl.hash) throw new Error("IWORK_MCP_PUBLIC_URL must be an origin without a path, query, or fragment");
+  if (parsedPublicUrl.protocol !== "https:" && !(parsedPublicUrl.protocol === "http:" && isLoopbackHostname(parsedPublicUrl.hostname))) throw new Error("IWORK_MCP_PUBLIC_URL must use HTTPS unless it is a loopback URL");
   const configDir = process.env.IWORK_MCP_CONFIG_DIR ?? join(homedir(), ".config", "iwork-mcp");
   const dataDir = process.env.IWORK_MCP_DATA_DIR ?? join(homedir(), ".local", "share", "iwork-mcp");
   if (!process.env.IWORK_MCP_PASSPHRASE) {
@@ -74,7 +81,8 @@ if (args[0] === "install") {
     }
   }
   const { listenHttp } = await import("./http.js");
-  await listenHttp({ host, port, publicUrl, configDir, dataDir, environmentPassphrase: process.env.IWORK_MCP_PASSPHRASE });
+  const redirectHostAllowlist = process.env.IWORK_MCP_REDIRECT_HOST_ALLOWLIST?.split(",").map(value => value.trim()).filter(Boolean);
+  await listenHttp({ host, port, publicUrl, configDir, dataDir, environmentPassphrase: process.env.IWORK_MCP_PASSPHRASE ? trimPastedLineEndings(process.env.IWORK_MCP_PASSPHRASE) : undefined, redirectHostAllowlist });
   console.error(`iwork-mcp HTTP server listening on ${host}:${port}; public URL ${publicUrl}`);
 } else {
   const { StdioServerTransport } = await import("@modelcontextprotocol/sdk/server/stdio.js");

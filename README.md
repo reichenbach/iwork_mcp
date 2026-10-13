@@ -66,6 +66,8 @@ IWORK_MCP_PUBLIC_URL=https://YOUR-TUNNEL-HOST iwork-mcp --http --port 8787
 
 The endpoint is `https://YOUR-TUNNEL-HOST/mcp`. It uses OAuth 2.1 dynamic client registration, authorization code with required PKCE S256, rotating refresh tokens, and short-lived opaque access tokens. Every MCP request requires a bearer token.
 
+Optionally set `IWORK_MCP_REDIRECT_HOST_ALLOWLIST` to a comma-separated list of permitted OAuth callback hosts, `host:port` pairs, or origins.
+
 For a free named Cloudflare Tunnel and the optional launch-at-login template, follow [Remote connector setup](docs/remote-setup.md).
 
 ### Grok Bot, Cursor, Claude, and Codex

@@ -4,6 +4,8 @@ import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 
 const scrypt = promisify(scryptCallback);
+const SHA256_KEY = /^[a-f0-9]{64}$/;
+const PKCE_VERIFIER = /^[A-Za-z0-9._~-]{43,128}$/;
 
 export interface ClientRecord {
   client_id: string;
@@ -14,12 +16,35 @@ export interface ClientRecord {
   response_types: string[];
   client_id_issued_at: number;
 }
+
+interface StoredClient extends ClientRecord { lastUsedAt: number }
 interface AuthorizationRecord { clientId: string; redirectUri: string; codeChallenge: string; expiresAt: number; used: boolean }
-interface TokenRecord { clientId: string; kind: "access" | "refresh"; expiresAt: number }
-interface PersistedState { clients: Record<string, ClientRecord>; authorizationCodes: Record<string, AuthorizationRecord>; tokens: Record<string, TokenRecord> }
+interface TokenRecord { clientId: string; kind: "access" | "refresh"; expiresAt: number; familyId: string; status: "active" | "used" | "revoked" }
+interface PersistedState { version: 2; clients: Record<string, StoredClient>; authorizationCodes: Record<string, AuthorizationRecord>; tokens: Record<string, TokenRecord> }
 interface PassphraseHash { algorithm: "scrypt"; salt: string; hash: string }
 
-function emptyState(): PersistedState { return { clients: {}, authorizationCodes: {}, tokens: {} }; }
+export interface OAuthStoreOptions {
+  codeTtlMs?: number;
+  accessTokenTtlMs?: number;
+  refreshTokenTtlMs?: number;
+  clientUnusedTtlMs?: number;
+  maxClients?: number;
+  persistDebounceMs?: number;
+}
+
+export interface AccessTokenIdentity { clientId: string; tokenHash: string; familyId: string; expiresAt: number }
+
+const DEFAULTS = {
+  codeTtlMs: 300_000,
+  accessTokenTtlMs: 900_000,
+  refreshTokenTtlMs: 2_592_000_000,
+  clientUnusedTtlMs: 2_592_000_000,
+  maxClients: 100,
+  persistDebounceMs: 50,
+};
+
+function emptyState(): PersistedState { return { version: 2, clients: {}, authorizationCodes: {}, tokens: {} }; }
+function hashSecret(value: string): string { return createHash("sha256").update(value).digest("hex"); }
 
 async function writePrivateJson(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
@@ -55,45 +80,187 @@ export async function verifyPassphrase(configDir: string, candidate: string, env
 
 export class OAuthStore {
   private state: PersistedState = emptyState();
-  private loaded = false;
-  constructor(private readonly statePath: string) {}
-  async load(): Promise<void> { if (!this.loaded) { this.state = await readJson<PersistedState>(this.statePath) ?? emptyState(); this.loaded = true; this.prune(); } }
-  private prune(): void {
+  private loadPromise?: Promise<void>;
+  private dirty = false;
+  private persistTimer?: NodeJS.Timeout;
+  private writeQueue: Promise<void> = Promise.resolve();
+  private readonly settings: typeof DEFAULTS;
+
+  constructor(private readonly statePath: string, options: OAuthStoreOptions = {}) {
+    this.settings = { ...DEFAULTS, ...options };
+  }
+
+  async load(): Promise<void> {
+    if (!this.loadPromise) this.loadPromise = this.loadState();
+    await this.loadPromise;
+  }
+
+  private async loadState(): Promise<void> {
+    const raw = await readJson<Partial<PersistedState> & { version?: number }>(this.statePath);
+    if (!raw) return;
     const now = Date.now();
-    for (const [code, record] of Object.entries(this.state.authorizationCodes)) if (record.expiresAt <= now || record.used) delete this.state.authorizationCodes[code];
-    for (const [token, record] of Object.entries(this.state.tokens)) if (record.expiresAt <= now) delete this.state.tokens[token];
+    const clients: Record<string, StoredClient> = {};
+    for (const [id, client] of Object.entries(raw.clients ?? {})) {
+      clients[id] = { ...client, lastUsedAt: (client as StoredClient).lastUsedAt ?? client.client_id_issued_at * 1000 };
+    }
+    const authorizationCodes: Record<string, AuthorizationRecord> = {};
+    for (const [key, record] of Object.entries(raw.authorizationCodes ?? {})) authorizationCodes[SHA256_KEY.test(key) ? key : hashSecret(key)] = record;
+    const tokens: Record<string, TokenRecord> = {};
+    for (const [key, value] of Object.entries(raw.tokens ?? {})) {
+      const record = value as Partial<TokenRecord> & Pick<TokenRecord, "clientId" | "kind" | "expiresAt">;
+      tokens[SHA256_KEY.test(key) ? key : hashSecret(key)] = {
+        clientId: record.clientId,
+        kind: record.kind,
+        expiresAt: record.expiresAt,
+        familyId: record.familyId ?? randomBytes(18).toString("base64url"),
+        status: record.status ?? "active",
+      };
+    }
+    this.state = { version: 2, clients, authorizationCodes, tokens };
+    const changed = raw.version !== 2 || this.prune(now);
+    if (changed) this.markDirty();
   }
-  private async persist(): Promise<void> { this.prune(); await writePrivateJson(this.statePath, this.state); }
-  async register(metadata: { redirect_uris: string[]; client_name?: string }): Promise<ClientRecord> {
+
+  private prune(now = Date.now()): boolean {
+    let changed = false;
+    for (const [codeHash, record] of Object.entries(this.state.authorizationCodes)) {
+      if (record.expiresAt <= now) { delete this.state.authorizationCodes[codeHash]; changed = true; }
+    }
+    for (const [tokenHash, record] of Object.entries(this.state.tokens)) {
+      if (record.expiresAt <= now) { delete this.state.tokens[tokenHash]; changed = true; }
+    }
+    const referencedClients = new Set([
+      ...Object.values(this.state.authorizationCodes).map(record => record.clientId),
+      ...Object.values(this.state.tokens).map(record => record.clientId),
+    ]);
+    for (const [clientId, client] of Object.entries(this.state.clients)) {
+      if (!referencedClients.has(clientId) && client.lastUsedAt + this.settings.clientUnusedTtlMs <= now) {
+        delete this.state.clients[clientId]; changed = true;
+      }
+    }
+    return changed;
+  }
+
+  async sweep(): Promise<void> {
     await this.load();
-    const client: ClientRecord = { client_id: randomBytes(24).toString("base64url"), redirect_uris: metadata.redirect_uris, client_name: metadata.client_name, token_endpoint_auth_method: "none", grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], client_id_issued_at: Math.floor(Date.now() / 1000) };
-    this.state.clients[client.client_id] = client; await this.persist(); return client;
+    if (this.prune()) this.markDirty();
   }
-  async client(clientId: string): Promise<ClientRecord | undefined> { await this.load(); return this.state.clients[clientId]; }
+
+  private markDirty(): void {
+    this.dirty = true;
+    if (this.persistTimer) return;
+    this.persistTimer = setTimeout(() => { this.persistTimer = undefined; void this.flush(); }, this.settings.persistDebounceMs);
+    this.persistTimer.unref();
+  }
+
+  async flush(): Promise<void> {
+    await this.load();
+    if (this.persistTimer) { clearTimeout(this.persistTimer); this.persistTimer = undefined; }
+    if (!this.dirty) return this.writeQueue;
+    this.dirty = false;
+    this.prune();
+    const snapshot = structuredClone(this.state);
+    this.writeQueue = this.writeQueue.then(() => writePrivateJson(this.statePath, snapshot));
+    await this.writeQueue;
+    if (this.dirty) this.markDirty();
+  }
+
+  async close(): Promise<void> { await this.flush(); }
+
+  async register(metadata: { redirect_uris: string[]; client_name?: string }): Promise<ClientRecord | undefined> {
+    await this.load();
+    if (this.prune()) this.markDirty();
+    if (Object.keys(this.state.clients).length >= this.settings.maxClients) return undefined;
+    const now = Date.now();
+    const client: StoredClient = {
+      client_id: randomBytes(24).toString("base64url"),
+      redirect_uris: metadata.redirect_uris,
+      client_name: metadata.client_name,
+      token_endpoint_auth_method: "none",
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      client_id_issued_at: Math.floor(now / 1000),
+      lastUsedAt: now,
+    };
+    this.state.clients[client.client_id] = client;
+    this.markDirty();
+    return this.publicClient(client);
+  }
+
+  async client(clientId: string): Promise<ClientRecord | undefined> {
+    await this.load();
+    const client = this.state.clients[clientId];
+    if (!client) return undefined;
+    if (Date.now() - client.lastUsedAt > 60_000) { client.lastUsedAt = Date.now(); this.markDirty(); }
+    return this.publicClient(client);
+  }
+
+  private publicClient(client: StoredClient): ClientRecord {
+    const { lastUsedAt: _lastUsedAt, ...publicRecord } = client;
+    return publicRecord;
+  }
+
   async issueCode(clientId: string, redirectUri: string, codeChallenge: string): Promise<string> {
-    await this.load(); const code = randomBytes(32).toString("base64url");
-    this.state.authorizationCodes[code] = { clientId, redirectUri, codeChallenge, expiresAt: Date.now() + 300_000, used: false }; await this.persist(); return code;
+    await this.load();
+    const code = randomBytes(32).toString("base64url");
+    this.state.authorizationCodes[hashSecret(code)] = { clientId, redirectUri, codeChallenge, expiresAt: Date.now() + this.settings.codeTtlMs, used: false };
+    this.markDirty();
+    return code;
   }
+
   async exchangeCode(code: string, clientId: string, redirectUri: string, verifier: string): Promise<{ access_token: string; refresh_token: string } | undefined> {
-    await this.load(); const record = this.state.authorizationCodes[code]; const challenge = createHash("sha256").update(verifier).digest("base64url");
+    await this.load();
+    if (!PKCE_VERIFIER.test(verifier)) return undefined;
+    const record = this.state.authorizationCodes[hashSecret(code)];
+    const challenge = createHash("sha256").update(verifier).digest("base64url");
     if (!record || record.used || record.expiresAt <= Date.now() || record.clientId !== clientId || record.redirectUri !== redirectUri || !safeEqual(record.codeChallenge, challenge)) return undefined;
-    record.used = true; return this.issueTokens(clientId);
+    record.used = true;
+    return this.issueTokens(clientId);
   }
+
   async refresh(refreshToken: string, clientId: string): Promise<{ access_token: string; refresh_token: string } | undefined> {
-    await this.load(); const record = this.state.tokens[refreshToken];
+    await this.load();
+    const record = this.state.tokens[hashSecret(refreshToken)];
     if (!record || record.kind !== "refresh" || record.expiresAt <= Date.now() || record.clientId !== clientId) return undefined;
-    delete this.state.tokens[refreshToken]; return this.issueTokens(clientId);
+    if (record.status !== "active") {
+      this.revokeFamily(record.familyId);
+      this.markDirty();
+      return undefined;
+    }
+    record.status = "used";
+    return this.issueTokens(clientId, record.familyId);
   }
-  private async issueTokens(clientId: string): Promise<{ access_token: string; refresh_token: string }> {
-    const access_token = randomBytes(32).toString("base64url"); const refresh_token = randomBytes(32).toString("base64url");
-    this.state.tokens[access_token] = { clientId, kind: "access", expiresAt: Date.now() + 900_000 };
-    this.state.tokens[refresh_token] = { clientId, kind: "refresh", expiresAt: Date.now() + 2_592_000_000 };
-    await this.persist(); return { access_token, refresh_token };
+
+  private async issueTokens(clientId: string, familyId = randomBytes(18).toString("base64url")): Promise<{ access_token: string; refresh_token: string }> {
+    const access_token = randomBytes(32).toString("base64url");
+    const refresh_token = randomBytes(32).toString("base64url");
+    this.state.tokens[hashSecret(access_token)] = { clientId, kind: "access", expiresAt: Date.now() + this.settings.accessTokenTtlMs, familyId, status: "active" };
+    this.state.tokens[hashSecret(refresh_token)] = { clientId, kind: "refresh", expiresAt: Date.now() + this.settings.refreshTokenTtlMs, familyId, status: "active" };
+    this.markDirty();
+    return { access_token, refresh_token };
   }
-  async validAccessToken(token: string): Promise<boolean> {
-    await this.load(); const found = Object.entries(this.state.tokens).find(([candidate]) => safeEqual(candidate, token));
-    return Boolean(found && found[1].kind === "access" && found[1].expiresAt > Date.now());
+
+  private revokeFamily(familyId: string): void {
+    for (const record of Object.values(this.state.tokens)) if (record.familyId === familyId) record.status = "revoked";
   }
+
+  async revoke(token: string, clientId: string): Promise<void> {
+    await this.load();
+    const record = this.state.tokens[hashSecret(token)];
+    if (!record || record.clientId !== clientId) return;
+    this.revokeFamily(record.familyId);
+    this.markDirty();
+  }
+
+  async accessToken(token: string): Promise<AccessTokenIdentity | undefined> {
+    await this.load();
+    const tokenHash = hashSecret(token);
+    const record = this.state.tokens[tokenHash];
+    if (!record || record.kind !== "access" || record.status !== "active" || record.expiresAt <= Date.now()) return undefined;
+    return { clientId: record.clientId, tokenHash, familyId: record.familyId, expiresAt: record.expiresAt };
+  }
+
+  async validAccessToken(token: string): Promise<boolean> { return Boolean(await this.accessToken(token)); }
 }
 
 export function safeEqual(a: string, b: string): boolean {

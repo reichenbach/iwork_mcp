@@ -40,6 +40,12 @@ cloudflared tunnel run YOUR-TUNNEL-NAME
 
 The public MCP URL is `https://YOUR-TUNNEL-HOST/mcp`. The issuer must be the externally visible origin, so `IWORK_MCP_PUBLIC_URL` must exactly match it and must not include `/mcp`.
 
+To restrict dynamic clients to known callback hosts, set a comma-separated allowlist. Entries may be hostnames, `host:port` pairs, or origins:
+
+```sh
+IWORK_MCP_REDIRECT_HOST_ALLOWLIST=127.0.0.1,localhost,client.example.com
+```
+
 For launch-at-login, copy [the plist template](../packaging/com.example.iwork-mcp.plist), replace its placeholders, and place the result in the current user's LaunchAgents directory. Keep secrets out of the plist; use the stored passphrase created above.
 
 ## Security notes
