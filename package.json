@@ -10,13 +10,19 @@
   "files": [
     "dist",
     "README.md",
-    "screenshots"
+    "screenshots",
+    "assets",
+    "skills",
+    "docs",
+    "packaging",
+    ".cursor-plugin",
+    "mcp.json"
   ],
   "scripts": {
     "build": "tsc && chmod +x dist/index.js",
     "dev": "tsc --watch",
     "prepare": "npm run build",
-    "test": "node --import tsx --test test/registration.test.ts test/jxa.test.ts",
+    "test": "node --import tsx --test test/registration.test.ts test/jxa.test.ts test/http.test.ts",
     "test:integration": "node --import tsx --test test/numbers.test.ts test/pages.test.ts test/keynote.test.ts",
     "test:all": "node --import tsx --test test/**/*.test.ts",
     "sync-counts": "node --import tsx scripts/sync-tool-counts.ts"

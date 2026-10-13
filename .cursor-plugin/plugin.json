@@ -1,0 +1,8 @@
+{
+  "name": "iwork-mcp",
+  "description": "Create and edit Numbers, Pages, and Keynote documents through MCP.",
+  "version": "0.8.8",
+  "logo": "assets/logo.svg",
+  "mcpServers": "mcp.json",
+  "skills": ["skills/keynote-deck", "skills/numbers-budget"]
+}

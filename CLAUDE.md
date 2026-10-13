@@ -4,7 +4,7 @@
 - MCP server for Apple iWork (Numbers, Pages, Keynote) automation via JXA/osascript
 - TypeScript, ESM, uses `@modelcontextprotocol/sdk` v1.26.0
 - 117 tools total: 50 Numbers, 26 Pages, 41 Keynote (includes 8 Creator Studio AI tools)
-- npm: `iwork-mcp` | GitHub: `reichenbach/iwork_mcp` (PRIVATE)
+- npm: `iwork-mcp`
 - Requirements: macOS 13+, iWork 14.0+, Node.js 18+
 - Supports both standard iWork and iWork 15.1+ "Creator Studio" app bundles (tested on 15.1.1)
 
@@ -72,7 +72,7 @@
 - **Keep version in sync**: bump -> build -> test -> commit -> push -> publish -> GitHub release
 - After each npm publish, create the matching GitHub release server-side: `gh release create vX.Y.Z --generate-notes`. GitHub Releases do NOT update automatically on publish — they lag behind npm unless this step runs (v0.8.6 sat as "Latest" long after 0.8.7 shipped).
 - **NEVER `git push --tags`** — stale local tags may pin old, rewritten history. Always create tags server-side via `gh release create`.
-- Commits must use the noreply email (`755929+reichenbach@users.noreply.github.com`); it's set as repo-local git config. Never commit with a personal address.
+- Follow the repository's configured commit identity. Never include personal addresses in public files.
 - Screenshots must be JPEG not PNG — large PNGs cause 503 errors on GitHub README rendering
 
 ## Known Issues
