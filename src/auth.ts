@@ -17,10 +17,10 @@ export interface ClientRecord {
   client_id_issued_at: number;
 }
 
-interface StoredClient extends ClientRecord { lastUsedAt: number }
+interface StoredClient extends ClientRecord { lastUsedAt: number; hasIssuedTokens: boolean }
 interface AuthorizationRecord { clientId: string; redirectUri: string; codeChallenge: string; expiresAt: number; used: boolean }
 interface TokenRecord { clientId: string; kind: "access" | "refresh"; expiresAt: number; familyId: string; status: "active" | "used" | "revoked" }
-interface PersistedState { version: 2; clients: Record<string, StoredClient>; authorizationCodes: Record<string, AuthorizationRecord>; tokens: Record<string, TokenRecord> }
+interface PersistedState { version: 3; clients: Record<string, StoredClient>; authorizationCodes: Record<string, AuthorizationRecord>; tokens: Record<string, TokenRecord> }
 interface PassphraseHash { algorithm: "scrypt"; salt: string; hash: string }
 
 export interface OAuthStoreOptions {
@@ -28,6 +28,7 @@ export interface OAuthStoreOptions {
   accessTokenTtlMs?: number;
   refreshTokenTtlMs?: number;
   clientUnusedTtlMs?: number;
+  clientInactiveTtlMs?: number;
   maxClients?: number;
   persistDebounceMs?: number;
 }
@@ -38,12 +39,13 @@ const DEFAULTS = {
   codeTtlMs: 300_000,
   accessTokenTtlMs: 900_000,
   refreshTokenTtlMs: 2_592_000_000,
-  clientUnusedTtlMs: 2_592_000_000,
+  clientUnusedTtlMs: 3_600_000,
+  clientInactiveTtlMs: 2_592_000_000,
   maxClients: 100,
   persistDebounceMs: 50,
 };
 
-function emptyState(): PersistedState { return { version: 2, clients: {}, authorizationCodes: {}, tokens: {} }; }
+function emptyState(): PersistedState { return { version: 3, clients: {}, authorizationCodes: {}, tokens: {} }; }
 function hashSecret(value: string): string { return createHash("sha256").update(value).digest("hex"); }
 
 async function writePrivateJson(path: string, value: unknown): Promise<void> {
@@ -99,10 +101,6 @@ export class OAuthStore {
     const raw = await readJson<Partial<PersistedState> & { version?: number }>(this.statePath);
     if (!raw) return;
     const now = Date.now();
-    const clients: Record<string, StoredClient> = {};
-    for (const [id, client] of Object.entries(raw.clients ?? {})) {
-      clients[id] = { ...client, lastUsedAt: (client as StoredClient).lastUsedAt ?? client.client_id_issued_at * 1000 };
-    }
     const authorizationCodes: Record<string, AuthorizationRecord> = {};
     for (const [key, record] of Object.entries(raw.authorizationCodes ?? {})) authorizationCodes[SHA256_KEY.test(key) ? key : hashSecret(key)] = record;
     const tokens: Record<string, TokenRecord> = {};
@@ -116,8 +114,17 @@ export class OAuthStore {
         status: record.status ?? "active",
       };
     }
-    this.state = { version: 2, clients, authorizationCodes, tokens };
-    const changed = raw.version !== 2 || this.prune(now);
+    const clientsWithTokens = new Set(Object.values(tokens).map(record => record.clientId));
+    const clients: Record<string, StoredClient> = {};
+    for (const [id, client] of Object.entries(raw.clients ?? {})) {
+      clients[id] = {
+        ...client,
+        lastUsedAt: (client as StoredClient).lastUsedAt ?? client.client_id_issued_at * 1000,
+        hasIssuedTokens: (client as StoredClient).hasIssuedTokens ?? clientsWithTokens.has(id),
+      };
+    }
+    this.state = { version: 3, clients, authorizationCodes, tokens };
+    const changed = raw.version !== 3 || this.prune(now);
     if (changed) this.markDirty();
   }
 
@@ -134,9 +141,11 @@ export class OAuthStore {
       ...Object.values(this.state.tokens).map(record => record.clientId),
     ]);
     for (const [clientId, client] of Object.entries(this.state.clients)) {
-      if (!referencedClients.has(clientId) && client.lastUsedAt + this.settings.clientUnusedTtlMs <= now) {
-        delete this.state.clients[clientId]; changed = true;
-      }
+      const ttl = client.hasIssuedTokens ? this.settings.clientInactiveTtlMs : this.settings.clientUnusedTtlMs;
+      if (client.lastUsedAt + ttl > now) continue;
+      if (client.hasIssuedTokens && referencedClients.has(clientId)) continue;
+      this.deleteClient(clientId);
+      changed = true;
     }
     return changed;
   }
@@ -170,7 +179,14 @@ export class OAuthStore {
   async register(metadata: { redirect_uris: string[]; client_name?: string }): Promise<ClientRecord | undefined> {
     await this.load();
     if (this.prune()) this.markDirty();
-    if (Object.keys(this.state.clients).length >= this.settings.maxClients) return undefined;
+    while (Object.keys(this.state.clients).length >= this.settings.maxClients) {
+      const oldestUnused = Object.values(this.state.clients)
+        .filter(client => !client.hasIssuedTokens)
+        .sort((left, right) => left.lastUsedAt - right.lastUsedAt || left.client_id_issued_at - right.client_id_issued_at)[0];
+      if (!oldestUnused) return undefined;
+      this.deleteClient(oldestUnused.client_id);
+      this.markDirty();
+    }
     const now = Date.now();
     const client: StoredClient = {
       client_id: randomBytes(24).toString("base64url"),
@@ -181,6 +197,7 @@ export class OAuthStore {
       response_types: ["code"],
       client_id_issued_at: Math.floor(now / 1000),
       lastUsedAt: now,
+      hasIssuedTokens: false,
     };
     this.state.clients[client.client_id] = client;
     this.markDirty();
@@ -191,17 +208,28 @@ export class OAuthStore {
     await this.load();
     const client = this.state.clients[clientId];
     if (!client) return undefined;
-    if (Date.now() - client.lastUsedAt > 60_000) { client.lastUsedAt = Date.now(); this.markDirty(); }
     return this.publicClient(client);
   }
 
   private publicClient(client: StoredClient): ClientRecord {
-    const { lastUsedAt: _lastUsedAt, ...publicRecord } = client;
+    const { lastUsedAt: _lastUsedAt, hasIssuedTokens: _hasIssuedTokens, ...publicRecord } = client;
     return publicRecord;
+  }
+
+  private deleteClient(clientId: string): void {
+    delete this.state.clients[clientId];
+    for (const [codeHash, record] of Object.entries(this.state.authorizationCodes)) {
+      if (record.clientId === clientId) delete this.state.authorizationCodes[codeHash];
+    }
+    for (const [tokenHash, record] of Object.entries(this.state.tokens)) {
+      if (record.clientId === clientId) delete this.state.tokens[tokenHash];
+    }
   }
 
   async issueCode(clientId: string, redirectUri: string, codeChallenge: string): Promise<string> {
     await this.load();
+    const client = this.state.clients[clientId];
+    if (client) client.lastUsedAt = Date.now();
     const code = randomBytes(32).toString("base64url");
     this.state.authorizationCodes[hashSecret(code)] = { clientId, redirectUri, codeChallenge, expiresAt: Date.now() + this.settings.codeTtlMs, used: false };
     this.markDirty();
@@ -232,6 +260,11 @@ export class OAuthStore {
   }
 
   private async issueTokens(clientId: string, familyId = randomBytes(18).toString("base64url")): Promise<{ access_token: string; refresh_token: string }> {
+    const client = this.state.clients[clientId];
+    if (client) {
+      client.lastUsedAt = Date.now();
+      client.hasIssuedTokens = true;
+    }
     const access_token = randomBytes(32).toString("base64url");
     const refresh_token = randomBytes(32).toString("base64url");
     this.state.tokens[hashSecret(access_token)] = { clientId, kind: "access", expiresAt: Date.now() + this.settings.accessTokenTtlMs, familyId, status: "active" };

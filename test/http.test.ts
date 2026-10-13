@@ -57,9 +57,13 @@ describe("OAuth token store", () => {
     const second = (await store.register({ redirect_uris: ["http://127.0.0.1/two"] }))!;
     const code = await store.issueCode(first.client_id, first.redirect_uris[0], challenge);
     const initial = (await store.exchangeCode(code, first.client_id, first.redirect_uris[0], verifier))!;
+    const initialIdentity = (await store.accessToken(initial.access_token))!;
     assert.equal(await store.refresh(initial.refresh_token, second.client_id), undefined);
     const rotated = await store.refresh(initial.refresh_token, first.client_id);
     assert.ok(rotated);
+    const rotatedIdentity = (await store.accessToken(rotated.access_token))!;
+    assert.equal(rotatedIdentity.familyId, initialIdentity.familyId);
+    assert.notEqual(rotatedIdentity.tokenHash, initialIdentity.tokenHash);
     assert.equal(await store.validAccessToken(rotated.access_token), true);
     assert.equal(await store.refresh(initial.refresh_token, first.client_id), undefined);
     assert.equal(await store.validAccessToken(initial.access_token), false);
@@ -67,13 +71,37 @@ describe("OAuth token store", () => {
     await store.close();
   });
 
-  it("caps registrations and prunes stale unused clients", async () => {
-    const store = new OAuthStore(join(directory, "bounded-state.json"), { maxClients: 1, clientUnusedTtlMs: 5 });
-    assert.ok(await store.register({ redirect_uris: ["http://127.0.0.1/one"] }));
-    assert.equal(await store.register({ redirect_uris: ["http://127.0.0.1/two"] }), undefined);
-    await sleep(10);
+  it("does not keep an unissued client alive when it is looked up", async () => {
+    const store = new OAuthStore(join(directory, "unused-state.json"), { clientUnusedTtlMs: 50 });
+    const client = (await store.register({ redirect_uris: ["http://127.0.0.1/one"] }))!;
+    await sleep(40);
+    assert.ok(await store.client(client.client_id));
+    await sleep(20);
     await store.sweep();
-    assert.ok(await store.register({ redirect_uris: ["http://127.0.0.1/two"] }));
+    assert.equal(await store.client(client.client_id), undefined);
+    await store.close();
+  });
+
+  it("evicts the oldest client without tokens at the cap and rejects when all have tokens", async () => {
+    const store = new OAuthStore(join(directory, "bounded-state.json"), { maxClients: 2, clientUnusedTtlMs: 60_000 });
+    const oldest = (await store.register({ redirect_uris: ["http://127.0.0.1/oldest"] }))!;
+    await sleep(5);
+    const retained = (await store.register({ redirect_uris: ["http://127.0.0.1/retained"] }))!;
+    const replacement = (await store.register({ redirect_uris: ["http://127.0.0.1/replacement"] }))!;
+    assert.equal(await store.client(oldest.client_id), undefined);
+    assert.ok(await store.client(retained.client_id));
+    assert.ok(await store.client(replacement.client_id));
+
+    await sleep(5);
+    const retainedCode = await store.issueCode(retained.client_id, retained.redirect_uris[0], challenge);
+    const newest = (await store.register({ redirect_uris: ["http://127.0.0.1/newest"] }))!;
+    assert.ok(await store.client(retained.client_id));
+    assert.equal(await store.client(replacement.client_id), undefined);
+
+    assert.ok(await store.exchangeCode(retainedCode, retained.client_id, retained.redirect_uris[0], verifier));
+    const newestCode = await store.issueCode(newest.client_id, newest.redirect_uris[0], challenge);
+    assert.ok(await store.exchangeCode(newestCode, newest.client_id, newest.redirect_uris[0], verifier));
+    assert.equal(await store.register({ redirect_uris: ["http://127.0.0.1/rejected"] }), undefined);
     await store.close();
   });
 });
@@ -278,7 +306,7 @@ describe("remote HTTP and OAuth", () => {
     ({ access_token: accessToken, refresh_token: refreshToken } = await authorizeTokens());
   });
 
-  it("returns 404 for unknown sessions and binds sessions to their creating token", async context => {
+  it("allows refreshed tokens from the session family and hides sessions from other families", async context => {
     if (!requireSocket(context)) return;
     const commonHeaders = { authorization: `Bearer ${accessToken}`, "content-type": "application/json", accept: "application/json, text/event-stream" };
     const unknown = await fetch(`${baseUrl}/mcp`, { method: "POST", headers: { ...commonHeaders, "mcp-session-id": randomUUID() }, body: "{}" });
@@ -291,9 +319,19 @@ describe("remote HTTP and OAuth", () => {
     assert.equal(initialize.status, 200);
     const sessionId = initialize.headers.get("mcp-session-id");
     assert.ok(sessionId);
-    const otherTokens = await authorizeTokens();
-    const mismatch = await fetch(`${baseUrl}/mcp`, { method: "POST", headers: { ...commonHeaders, authorization: `Bearer ${otherTokens.access_token}`, "mcp-session-id": sessionId }, body: "{}" });
-    assert.equal(mismatch.status, 403);
+    const refresh = await fetch(`${baseUrl}/token`, { method: "POST", body: new URLSearchParams({ grant_type: "refresh_token", client_id: clientId, refresh_token: refreshToken }) });
+    assert.equal(refresh.status, 200);
+    ({ access_token: accessToken, refresh_token: refreshToken } = await refresh.json() as { access_token: string; refresh_token: string });
+    const resumed = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers: { ...commonHeaders, authorization: `Bearer ${accessToken}`, "mcp-session-id": sessionId },
+      body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+    });
+    assert.equal(resumed.status, 202);
+
+    const otherFamily = await authorizeTokens();
+    const mismatch = await fetch(`${baseUrl}/mcp`, { method: "POST", headers: { ...commonHeaders, authorization: `Bearer ${otherFamily.access_token}`, "mcp-session-id": sessionId }, body: "{}" });
+    assert.equal(mismatch.status, 404);
   });
 
   it("rate-limits concurrent wrong passphrases before verification", async context => {

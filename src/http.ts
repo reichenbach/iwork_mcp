@@ -9,7 +9,7 @@ import { createIWorkServer } from "./server.js";
 interface PendingAuthorization { clientId: string; redirectUri: string; state?: string; codeChallenge: string; expiresAt: number }
 interface ConsentAttempt { attempts: number; failures: number; expiresAt: number }
 interface RegistrationAttempt { count: number; resetAt: number }
-interface McpSession { transport: StreamableHTTPServerTransport; server: McpServer; clientId: string; tokenHash: string; lastUsedAt: number }
+interface McpSession { transport: StreamableHTTPServerTransport; server: McpServer; clientId: string; familyId: string; lastUsedAt: number }
 
 export interface HttpServerOptions {
   host: string;
@@ -286,7 +286,7 @@ export function createHttpServer(options: HttpServerOptions): Server {
           current = undefined;
         }
         if (sessionId && !current) return json(res, 404, { error: "unknown_session" });
-        if (current && (current.clientId !== identity.clientId || current.tokenHash !== identity.tokenHash)) return json(res, 403, { error: "session_token_mismatch" });
+        if (current && (current.clientId !== identity.clientId || current.familyId !== identity.familyId)) return json(res, 404, { error: "unknown_session" });
         if (!current) {
           if (transports.size >= maxSessions) return json(res, 429, { error: "too_many_sessions" }, { "retry-after": "60" });
           let mcpServer: McpServer;
@@ -296,13 +296,13 @@ export function createHttpServer(options: HttpServerOptions): Server {
             sessionIdGenerator: randomUUID,
             allowedHosts,
             enableDnsRebindingProtection: true,
-            onsessioninitialized: (id): void => { transports.set(id, { transport, server: mcpServer, clientId: identity.clientId, tokenHash: identity.tokenHash, lastUsedAt: Date.now() }); },
+            onsessioninitialized: (id): void => { transports.set(id, { transport, server: mcpServer, clientId: identity.clientId, familyId: identity.familyId, lastUsedAt: Date.now() }); },
             onsessionclosed: (id): void => { transports.delete(id); },
           });
           mcpServer = createIWorkServer({ platform: options.platform });
           transport.onclose = () => { if (transport.sessionId) transports.delete(transport.sessionId); };
           await mcpServer.connect(transport);
-          current = { transport, server: mcpServer, clientId: identity.clientId, tokenHash: identity.tokenHash, lastUsedAt: Date.now() };
+          current = { transport, server: mcpServer, clientId: identity.clientId, familyId: identity.familyId, lastUsedAt: Date.now() };
         }
         current.lastUsedAt = Date.now();
         return current.transport.handleRequest(req, res);
