@@ -57,6 +57,8 @@ codex mcp add iwork -- npx -y iwork-mcp
 
 ## Remote HTTP setup
 
+> **Runs on your own Mac.** iWork (Pages, Numbers, Keynote) is macOS-only, so this server must run on the Mac that has iWork installed. The Cloudflare Tunnel only exposes that Mac's server to remote clients; it cannot run in the cloud.
+
 First configure an owner passphrase and start the server. It binds only to loopback by default:
 
 ```bash
@@ -161,6 +163,8 @@ curl -i -X POST http://127.0.0.1:8787/mcp \
 Copy the `mcp-session-id` response header, send an `notifications/initialized` notification, then call `tools/list` with the same bearer token and session header. The automated test performs this complete sequence and verifies that HTTP returns the same 117 tools as stdio.
 
 ## Security and limitations
+
+- Known limitation: `/register` is rate-limited per remote address. Behind `cloudflared` every request arrives from loopback, so all clients share one bucket; a flood of registrations can temporarily block new client setup (existing tokens are unaffected).
 
 The HTTP server defaults to `127.0.0.1`. Keep it on loopback behind an HTTPS tunnel, set `IWORK_MCP_PUBLIC_URL` to the exact external origin, use a strong owner passphrase, and never store secrets in the repository. OAuth state is stored in the current user's data directory with mode `0600`; the passphrase hash is stored separately in the current user's configuration directory.
 
