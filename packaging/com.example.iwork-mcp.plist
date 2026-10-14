@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.example.iwork-mcp</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>YOUR-NODE-PATH</string>
+    <string>YOUR-IWORK-MCP-PATH</string>
+    <string>--http</string><string>--host</string><string>127.0.0.1</string><string>--port</string><string>8787</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>IWORK_MCP_PUBLIC_URL</key><string>https://YOUR-TUNNEL-HOST</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>YOUR-LOG-DIRECTORY/iwork-mcp.log</string>
+  <key>StandardErrorPath</key><string>YOUR-LOG-DIRECTORY/iwork-mcp-error.log</string>
+</dict>
+</plist>
