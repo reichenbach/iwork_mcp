@@ -164,7 +164,7 @@ Copy the `mcp-session-id` response header, send an `notifications/initialized` n
 
 ## Security and limitations
 
-- Known limitation: `/register` is rate-limited per remote address. Behind `cloudflared` every request arrives from loopback, so all clients share one bucket; a flood of registrations can temporarily block new client setup (existing tokens are unaffected).
+- `/register` allows 20 attempts per client per minute, with a global cap of 200 attempts per minute. It uses the first valid `CF-Connecting-IP` value only when the socket peer is loopback; otherwise it uses the socket address. Client buckets are capped at 1,000 entries, evicting expired or oldest entries as needed. A registration flood can temporarily block new client setup (existing tokens are unaffected).
 
 The HTTP server defaults to `127.0.0.1`. Keep it on loopback behind an HTTPS tunnel, set `IWORK_MCP_PUBLIC_URL` to the exact external origin, use a strong owner passphrase, and never store secrets in the repository. OAuth state is stored in the current user's data directory with mode `0600`; the passphrase hash is stored separately in the current user's configuration directory.
 

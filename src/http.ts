@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { isIP } from "node:net";
 import { join } from "node:path";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -28,7 +29,9 @@ export interface HttpServerOptions {
   passphraseBackoffDecayMs?: number;
   maxConsentFailures?: number;
   registrationLimit?: number;
+  globalRegistrationLimit?: number;
   registrationWindowMs?: number;
+  maxRegistrationBuckets?: number;
   maxPendingAuthorizations?: number;
   maxSessions?: number;
   oauthStoreOptions?: OAuthStoreOptions;
@@ -68,6 +71,19 @@ function escaped(value: string): string {
 
 function bearer(req: IncomingMessage): string | undefined { return /^Bearer ([A-Za-z0-9_-]+)$/.exec(req.headers.authorization ?? "")?.[1]; }
 function isLoopbackHostname(hostname: string): boolean { return ["127.0.0.1", "localhost", "[::1]"].includes(hostname.toLowerCase()); }
+
+export function registrationClientKey(remoteAddress: string | undefined, connectingIp: string | string[] | undefined): string {
+  const peer = remoteAddress ?? "unknown";
+  const loopback = (isIP(peer) === 4 && peer.startsWith("127."))
+    || peer === "::1"
+    || (isIP(peer) === 6 && /^::ffff:127\./i.test(peer));
+  // Only a local tunnel proxy may supply the client address. Never search later
+  // header values when the first value is missing or invalid.
+  const first = (Array.isArray(connectingIp) ? connectingIp[0] : connectingIp)?.split(",", 1)[0].trim();
+  if (!loopback || !first || !isIP(first) || first.includes("%")) return peer;
+  // Canonicalize IPv6 so alternate spellings share the same budget.
+  return isIP(first) === 6 ? new URL(`http://[${first}]`).hostname.slice(1, -1) : first;
+}
 
 function isSafeRedirect(value: string, allowlist: Set<string>): boolean {
   try {
@@ -124,7 +140,10 @@ export function createHttpServer(options: HttpServerOptions): Server {
   const backoffDecayMs = options.passphraseBackoffDecayMs ?? 60_000;
   const maxConsentFailures = options.maxConsentFailures ?? 5;
   const registrationLimit = options.registrationLimit ?? 20;
+  const globalRegistrationLimit = options.globalRegistrationLimit ?? 200;
   const registrationWindowMs = options.registrationWindowMs ?? 60_000;
+  const maxRegistrationBuckets = Math.max(1, options.maxRegistrationBuckets ?? 1_000);
+  let globalRegistrationAttempt: RegistrationAttempt = { count: 0, resetAt: 0 };
   const maxPendingAuthorizations = options.maxPendingAuthorizations ?? 1_000;
   const maxSessions = options.maxSessions ?? 100;
   const globalBackoff = { failures: 0, lastFailureAt: 0, blockedUntil: 0 };
@@ -191,12 +210,22 @@ export function createHttpServer(options: HttpServerOptions): Server {
       }
       if (req.method === "POST" && url.pathname === "/register") {
         const now = Date.now();
-        const key = req.socket.remoteAddress ?? "unknown";
-        const existing = registrationAttempts.get(key);
-        const rate = existing && existing.resetAt > now ? existing : { count: 0, resetAt: now + registrationWindowMs };
+        if (globalRegistrationAttempt.resetAt <= now) globalRegistrationAttempt = { count: 0, resetAt: now + registrationWindowMs };
+        if (globalRegistrationAttempt.count >= globalRegistrationLimit) return json(res, 429, { error: "too_many_requests" }, { "retry-after": String(Math.max(1, Math.ceil((globalRegistrationAttempt.resetAt - now) / 1000))) });
+        globalRegistrationAttempt.count += 1;
+        const key = registrationClientKey(req.socket.remoteAddress, req.headers["cf-connecting-ip"]);
+        let rate = registrationAttempts.get(key);
+        if (!rate || rate.resetAt <= now) {
+          registrationAttempts.delete(key);
+          if (registrationAttempts.size >= maxRegistrationBuckets) {
+            for (const [address, attempt] of registrationAttempts) if (attempt.resetAt <= now) registrationAttempts.delete(address);
+            while (registrationAttempts.size >= maxRegistrationBuckets) registrationAttempts.delete(registrationAttempts.keys().next().value!);
+          }
+          rate = { count: 0, resetAt: now + registrationWindowMs };
+          registrationAttempts.set(key, rate);
+        }
+        if (rate.count >= registrationLimit) return json(res, 429, { error: "too_many_requests" }, { "retry-after": String(Math.max(1, Math.ceil((rate.resetAt - now) / 1000))) });
         rate.count += 1;
-        registrationAttempts.set(key, rate);
-        if (rate.count > registrationLimit) return json(res, 429, { error: "too_many_requests" }, { "retry-after": String(Math.max(1, Math.ceil((rate.resetAt - now) / 1000))) });
         const input = JSON.parse(await body(req)) as Record<string, unknown>;
         if (!Array.isArray(input.redirect_uris) || input.redirect_uris.length === 0 || input.redirect_uris.length > 10 || input.redirect_uris.some(item => typeof item !== "string" || !isSafeRedirect(item, redirectAllowlist))) return json(res, 400, { error: "invalid_redirect_uri" });
         if (input.client_name !== undefined && (typeof input.client_name !== "string" || input.client_name.length > 200)) return json(res, 400, { error: "invalid_client_metadata" });
