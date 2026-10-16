@@ -9,7 +9,7 @@ import type { AddressInfo } from "node:net";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { OAuthStore } from "../src/auth.js";
-import { createHttpServer } from "../src/http.js";
+import { createHttpServer, registrationClientKey } from "../src/http.js";
 
 const sleep = (milliseconds: number): Promise<void> => new Promise(resolve => setTimeout(resolve, milliseconds));
 const verifier = "test-verifier-that-is-long-enough-for-pkce-0123456789";
@@ -106,6 +106,46 @@ describe("OAuth token store", () => {
   });
 });
 
+describe("registration client keys", () => {
+  it("trusts CF-Connecting-IP only from loopback socket peers", () => {
+    for (const peer of ["127.0.0.1", "127.42.0.2", "::1", "::ffff:127.0.0.1", "::ffff:127.42.0.2", "::ffff:7f00:1"]) {
+      assert.equal(registrationClientKey(peer, "198.51.100.1"), "198.51.100.1");
+    }
+    for (const [peer, key] of [["192.0.2.1", "192.0.2.1"], ["128.0.0.1", "128.0.0.1"], ["::ffff:192.0.2.1", "192.0.2.1"], ["2001:db8::1", "2001:db8::/64"], [undefined, "unknown"]]) {
+      assert.equal(registrationClientKey(peer, "198.51.100.1"), key);
+      assert.equal(registrationClientKey(peer, "198.51.100.2"), key);
+    }
+  });
+
+  it("uses only the first valid IP value and falls back for invalid headers", () => {
+    assert.equal(registrationClientKey("::1", " 198.51.100.1, 198.51.100.2"), "198.51.100.1");
+    assert.equal(registrationClientKey("::1", ["198.51.100.1", "198.51.100.2"]), "198.51.100.1");
+    assert.equal(registrationClientKey("::1", "2001:0DB8:0:0:0:0:0:1"), "2001:db8::/64");
+    for (const value of [undefined, [], "", "garbage", "999.0.0.1", "198.51.100.1:80", "[::1]", "fe80::1%lo0", ", 198.51.100.1", "bad, 198.51.100.1", ["bad", "198.51.100.1"]]) {
+      assert.equal(registrationClientKey("127.0.0.1", value), "127.0.0.1");
+    }
+  });
+
+  it("groups IPv6 addresses by /64 for headers and socket peers", () => {
+    for (const address of ["2001:db8:abcd:1234::1", "2001:0DB8:abcd:1234:ffff:ffff:ffff:ffff", "2001:db8:abcd:1234::"]) {
+      assert.equal(registrationClientKey("127.0.0.1", address), "2001:db8:abcd:1234::/64");
+      assert.equal(registrationClientKey(address, undefined), "2001:db8:abcd:1234::/64");
+    }
+    assert.equal(registrationClientKey("::1", "2001:db8:abcd:1235::1"), "2001:db8:abcd:1235::/64");
+    assert.equal(registrationClientKey("::1", "2001:db8::1"), "2001:db8::/64");
+    assert.equal(registrationClientKey("::1", undefined), "::/64");
+    assert.equal(registrationClientKey("::1", "::"), "::/64");
+  });
+
+  it("normalizes IPv4-mapped IPv6 addresses to IPv4 for headers and socket peers", () => {
+    for (const address of ["192.0.2.1", "::ffff:192.0.2.1", "::FFFF:c000:201", "0:0:0:0:0:ffff:c000:0201"]) {
+      assert.equal(registrationClientKey("127.0.0.1", address), "192.0.2.1");
+      assert.equal(registrationClientKey(address, undefined), "192.0.2.1");
+    }
+    assert.equal(registrationClientKey("::1", "::ffff:192.0.2.2"), "192.0.2.2");
+  });
+});
+
 describe("remote HTTP and OAuth", () => {
   let directory: string;
   let baseUrl: string;
@@ -172,6 +212,25 @@ describe("remote HTTP and OAuth", () => {
     await new Promise<void>((resolve, reject) => target.close(error => error ? reject(error) : resolve()));
   }
 
+  async function registerViaHttp(url: string, connectingIp?: string | string[]): Promise<{ status: number; retryAfter: string | undefined; body: unknown }> {
+    return new Promise((resolve, reject) => {
+      const request = httpRequest(`${url}/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(connectingIp === undefined ? {} : { "CF-Connecting-IP": connectingIp }) },
+      }, response => {
+        const chunks: Buffer[] = [];
+        response.on("data", chunk => chunks.push(Buffer.from(chunk)));
+        response.once("error", reject);
+        response.once("end", () => {
+          try { resolve({ status: response.statusCode ?? 0, retryAfter: response.headers["retry-after"], body: JSON.parse(Buffer.concat(chunks).toString("utf8")) }); }
+          catch (error) { reject(error); }
+        });
+      });
+      request.once("error", reject);
+      request.end(JSON.stringify({ redirect_uris: [redirectUri] }));
+    });
+  }
+
   async function registerAndAuthorize(url: string): Promise<{ clientId: string; accessToken: string }> {
     const registrationResponse = await fetch(`${url}/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ redirect_uris: [redirectUri], client_name: "Short-lived Agent" }) });
     assert.equal(registrationResponse.status, 201);
@@ -197,6 +256,92 @@ describe("remote HTTP and OAuth", () => {
     assert.deepEqual(authorization.code_challenge_methods_supported, ["S256"]);
     assert.deepEqual(authorization.grant_types_supported, ["authorization_code", "refresh_token"]);
     assert.equal(authorization.revocation_endpoint, "http://127.0.0.1/revoke");
+  });
+
+  it("gives loopback-proxied clients separate registration budgets", async context => {
+    if (!requireSocket(context)) return;
+    const { supplemental, url } = await startSupplementalServer("registration-clients", { registrationLimit: 1 });
+    try {
+      assert.equal((await registerViaHttp(url, "198.51.100.1")).status, 201);
+      const limited = await registerViaHttp(url, "198.51.100.1, 198.51.100.99");
+      assert.equal(limited.status, 429);
+      assert.deepEqual(limited.body, { error: "too_many_requests" });
+      assert.ok(Number(limited.retryAfter) > 0);
+      assert.equal((await registerViaHttp(url, ["198.51.100.2", "198.51.100.1"])).status, 201);
+      assert.equal((await registerViaHttp(url, "198.51.100.2")).status, 429);
+      assert.equal((await registerViaHttp(url)).status, 201);
+      assert.equal((await registerViaHttp(url, "invalid, 198.51.100.3")).status, 429);
+    } finally { await closeServer(supplemental); }
+  });
+
+  it("does not charge client-limited rejections against the global registration budget", async context => {
+    if (!requireSocket(context)) return;
+    const { supplemental, url } = await startSupplementalServer("registration-rejections", { registrationLimit: 1, globalRegistrationLimit: 2 });
+    try {
+      assert.equal((await registerViaHttp(url, "198.51.100.1")).status, 201);
+      for (let count = 0; count < 3; count += 1) {
+        const limited = await registerViaHttp(url, "198.51.100.1");
+        assert.equal(limited.status, 429);
+        assert.deepEqual(limited.body, { error: "too_many_requests" });
+        assert.ok(Number(limited.retryAfter) > 0);
+      }
+      assert.equal((await registerViaHttp(url, "198.51.100.2")).status, 201);
+      assert.equal((await registerViaHttp(url, "198.51.100.3")).status, 429);
+    } finally { await closeServer(supplemental); }
+  });
+
+  it("shares registration budgets across IPv6 /64 addresses and mapped IPv4 spellings", async context => {
+    if (!requireSocket(context)) return;
+    const { supplemental, url } = await startSupplementalServer("registration-normalization", { registrationLimit: 1 });
+    try {
+      assert.equal((await registerViaHttp(url, "2001:db8:abcd:1234::1")).status, 201);
+      assert.equal((await registerViaHttp(url, "2001:0DB8:abcd:1234:ffff:ffff:ffff:ffff")).status, 429);
+      assert.equal((await registerViaHttp(url, "2001:db8:abcd:1235::1")).status, 201);
+      assert.equal((await registerViaHttp(url, "192.0.2.1")).status, 201);
+      assert.equal((await registerViaHttp(url, "::ffff:192.0.2.1")).status, 429);
+      assert.equal((await registerViaHttp(url, "::ffff:c000:201")).status, 429);
+    } finally { await closeServer(supplemental); }
+  });
+
+  it("caps registration attempts globally across client keys and bucket eviction", async context => {
+    if (!requireSocket(context)) return;
+    const { supplemental, url } = await startSupplementalServer("registration-global", { registrationLimit: 2, globalRegistrationLimit: 3, maxRegistrationBuckets: 1 });
+    try {
+      for (const ip of ["198.51.100.1", "198.51.100.2", "198.51.100.3"]) assert.equal((await registerViaHttp(url, ip)).status, 201);
+      for (const ip of ["198.51.100.4", "198.51.100.1"]) {
+        const limited = await registerViaHttp(url, ip);
+        assert.equal(limited.status, 429);
+        assert.deepEqual(limited.body, { error: "too_many_requests" });
+        assert.ok(Number(limited.retryAfter) > 0);
+      }
+    } finally { await closeServer(supplemental); }
+  });
+
+  it("evicts the oldest registration bucket at the memory cap", async context => {
+    if (!requireSocket(context)) return;
+    const { supplemental, url } = await startSupplementalServer("registration-buckets", { registrationLimit: 1, maxRegistrationBuckets: 2 });
+    try {
+      assert.equal((await registerViaHttp(url, "198.51.100.1")).status, 201);
+      assert.equal((await registerViaHttp(url, "198.51.100.2")).status, 201);
+      assert.equal((await registerViaHttp(url, "198.51.100.1")).status, 429);
+      assert.equal((await registerViaHttp(url, "198.51.100.3")).status, 201);
+      assert.equal((await registerViaHttp(url, "198.51.100.2")).status, 429);
+      assert.equal((await registerViaHttp(url, "198.51.100.1")).status, 201);
+    } finally { await closeServer(supplemental); }
+  });
+
+  it("renews expired client and global registration budgets before a sweep", async context => {
+    if (!requireSocket(context)) return;
+    const { supplemental, url } = await startSupplementalServer("registration-expiry", { registrationLimit: 1, globalRegistrationLimit: 2, registrationWindowMs: 100, sweepIntervalMs: 60_000 });
+    try {
+      assert.equal((await registerViaHttp(url, "198.51.100.1")).status, 201);
+      assert.equal((await registerViaHttp(url, "198.51.100.1")).status, 429);
+      assert.equal((await registerViaHttp(url, "198.51.100.2")).status, 201);
+      assert.equal((await registerViaHttp(url, "198.51.100.3")).status, 429);
+      await sleep(150);
+      assert.equal((await registerViaHttp(url, "198.51.100.1")).status, 201);
+      assert.equal((await registerViaHttp(url, "198.51.100.2")).status, 201);
+    } finally { await closeServer(supplemental); }
   });
 
   it("dynamically registers a public client and rejects unsafe redirects", async context => {
