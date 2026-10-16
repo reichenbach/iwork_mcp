@@ -108,22 +108,41 @@ describe("OAuth token store", () => {
 
 describe("registration client keys", () => {
   it("trusts CF-Connecting-IP only from loopback socket peers", () => {
-    for (const peer of ["127.0.0.1", "127.42.0.2", "::1", "::ffff:127.0.0.1", "::ffff:127.42.0.2"]) {
+    for (const peer of ["127.0.0.1", "127.42.0.2", "::1", "::ffff:127.0.0.1", "::ffff:127.42.0.2", "::ffff:7f00:1"]) {
       assert.equal(registrationClientKey(peer, "198.51.100.1"), "198.51.100.1");
     }
-    for (const peer of ["192.0.2.1", "128.0.0.1", "::ffff:192.0.2.1", "2001:db8::1", undefined]) {
-      assert.equal(registrationClientKey(peer, "198.51.100.1"), peer ?? "unknown");
-      assert.equal(registrationClientKey(peer, "198.51.100.2"), peer ?? "unknown");
+    for (const [peer, key] of [["192.0.2.1", "192.0.2.1"], ["128.0.0.1", "128.0.0.1"], ["::ffff:192.0.2.1", "192.0.2.1"], ["2001:db8::1", "2001:db8::/64"], [undefined, "unknown"]]) {
+      assert.equal(registrationClientKey(peer, "198.51.100.1"), key);
+      assert.equal(registrationClientKey(peer, "198.51.100.2"), key);
     }
   });
 
   it("uses only the first valid IP value and falls back for invalid headers", () => {
     assert.equal(registrationClientKey("::1", " 198.51.100.1, 198.51.100.2"), "198.51.100.1");
     assert.equal(registrationClientKey("::1", ["198.51.100.1", "198.51.100.2"]), "198.51.100.1");
-    assert.equal(registrationClientKey("::1", "2001:0DB8:0:0:0:0:0:1"), "2001:db8::1");
+    assert.equal(registrationClientKey("::1", "2001:0DB8:0:0:0:0:0:1"), "2001:db8::/64");
     for (const value of [undefined, [], "", "garbage", "999.0.0.1", "198.51.100.1:80", "[::1]", "fe80::1%lo0", ", 198.51.100.1", "bad, 198.51.100.1", ["bad", "198.51.100.1"]]) {
       assert.equal(registrationClientKey("127.0.0.1", value), "127.0.0.1");
     }
+  });
+
+  it("groups IPv6 addresses by /64 for headers and socket peers", () => {
+    for (const address of ["2001:db8:abcd:1234::1", "2001:0DB8:abcd:1234:ffff:ffff:ffff:ffff", "2001:db8:abcd:1234::"]) {
+      assert.equal(registrationClientKey("127.0.0.1", address), "2001:db8:abcd:1234::/64");
+      assert.equal(registrationClientKey(address, undefined), "2001:db8:abcd:1234::/64");
+    }
+    assert.equal(registrationClientKey("::1", "2001:db8:abcd:1235::1"), "2001:db8:abcd:1235::/64");
+    assert.equal(registrationClientKey("::1", "2001:db8::1"), "2001:db8::/64");
+    assert.equal(registrationClientKey("::1", undefined), "::/64");
+    assert.equal(registrationClientKey("::1", "::"), "::/64");
+  });
+
+  it("normalizes IPv4-mapped IPv6 addresses to IPv4 for headers and socket peers", () => {
+    for (const address of ["192.0.2.1", "::ffff:192.0.2.1", "::FFFF:c000:201", "0:0:0:0:0:ffff:c000:0201"]) {
+      assert.equal(registrationClientKey("127.0.0.1", address), "192.0.2.1");
+      assert.equal(registrationClientKey(address, undefined), "192.0.2.1");
+    }
+    assert.equal(registrationClientKey("::1", "::ffff:192.0.2.2"), "192.0.2.2");
   });
 });
 
@@ -255,6 +274,35 @@ describe("remote HTTP and OAuth", () => {
     } finally { await closeServer(supplemental); }
   });
 
+  it("does not charge client-limited rejections against the global registration budget", async context => {
+    if (!requireSocket(context)) return;
+    const { supplemental, url } = await startSupplementalServer("registration-rejections", { registrationLimit: 1, globalRegistrationLimit: 2 });
+    try {
+      assert.equal((await registerViaHttp(url, "198.51.100.1")).status, 201);
+      for (let count = 0; count < 3; count += 1) {
+        const limited = await registerViaHttp(url, "198.51.100.1");
+        assert.equal(limited.status, 429);
+        assert.deepEqual(limited.body, { error: "too_many_requests" });
+        assert.ok(Number(limited.retryAfter) > 0);
+      }
+      assert.equal((await registerViaHttp(url, "198.51.100.2")).status, 201);
+      assert.equal((await registerViaHttp(url, "198.51.100.3")).status, 429);
+    } finally { await closeServer(supplemental); }
+  });
+
+  it("shares registration budgets across IPv6 /64 addresses and mapped IPv4 spellings", async context => {
+    if (!requireSocket(context)) return;
+    const { supplemental, url } = await startSupplementalServer("registration-normalization", { registrationLimit: 1 });
+    try {
+      assert.equal((await registerViaHttp(url, "2001:db8:abcd:1234::1")).status, 201);
+      assert.equal((await registerViaHttp(url, "2001:0DB8:abcd:1234:ffff:ffff:ffff:ffff")).status, 429);
+      assert.equal((await registerViaHttp(url, "2001:db8:abcd:1235::1")).status, 201);
+      assert.equal((await registerViaHttp(url, "192.0.2.1")).status, 201);
+      assert.equal((await registerViaHttp(url, "::ffff:192.0.2.1")).status, 429);
+      assert.equal((await registerViaHttp(url, "::ffff:c000:201")).status, 429);
+    } finally { await closeServer(supplemental); }
+  });
+
   it("caps registration attempts globally across client keys and bucket eviction", async context => {
     if (!requireSocket(context)) return;
     const { supplemental, url } = await startSupplementalServer("registration-global", { registrationLimit: 2, globalRegistrationLimit: 3, maxRegistrationBuckets: 1 });
@@ -288,7 +336,8 @@ describe("remote HTTP and OAuth", () => {
     try {
       assert.equal((await registerViaHttp(url, "198.51.100.1")).status, 201);
       assert.equal((await registerViaHttp(url, "198.51.100.1")).status, 429);
-      assert.equal((await registerViaHttp(url, "198.51.100.2")).status, 429);
+      assert.equal((await registerViaHttp(url, "198.51.100.2")).status, 201);
+      assert.equal((await registerViaHttp(url, "198.51.100.3")).status, 429);
       await sleep(150);
       assert.equal((await registerViaHttp(url, "198.51.100.1")).status, 201);
       assert.equal((await registerViaHttp(url, "198.51.100.2")).status, 201);

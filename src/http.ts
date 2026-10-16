@@ -72,17 +72,35 @@ function escaped(value: string): string {
 function bearer(req: IncomingMessage): string | undefined { return /^Bearer ([A-Za-z0-9_-]+)$/.exec(req.headers.authorization ?? "")?.[1]; }
 function isLoopbackHostname(hostname: string): boolean { return ["127.0.0.1", "localhost", "[::1]"].includes(hostname.toLowerCase()); }
 
+function canonicalIp(address: string): string {
+  if (isIP(address) !== 6) return address;
+  const canonical = new URL(`http://[${address.split("%", 1)[0]}]`).hostname.slice(1, -1);
+  const mapped = /^::ffff:([0-9a-f]+):([0-9a-f]+)$/.exec(canonical);
+  if (!mapped) return canonical;
+  const high = parseInt(mapped[1], 16);
+  const low = parseInt(mapped[2], 16);
+  return `${high >>> 8}.${high & 255}.${low >>> 8}.${low & 255}`;
+}
+
+function registrationAddressKey(address: string): string {
+  const canonical = canonicalIp(address);
+  if (isIP(canonical) !== 6) return canonical;
+  const [left, right] = canonical.split("::");
+  const head = left ? left.split(":") : [];
+  const tail = right ? right.split(":") : [];
+  const groups = right === undefined ? head : [...head, ...Array<string>(8 - head.length - tail.length).fill("0"), ...tail];
+  const prefix = new URL(`http://[${groups.slice(0, 4).join(":")}::]`).hostname.slice(1, -1);
+  return `${prefix}/64`;
+}
+
 export function registrationClientKey(remoteAddress: string | undefined, connectingIp: string | string[] | undefined): string {
-  const peer = remoteAddress ?? "unknown";
+  const peer = canonicalIp(remoteAddress ?? "unknown");
   const loopback = (isIP(peer) === 4 && peer.startsWith("127."))
-    || peer === "::1"
-    || (isIP(peer) === 6 && /^::ffff:127\./i.test(peer));
-  // Only a local tunnel proxy may supply the client address. Never search later
-  // header values when the first value is missing or invalid.
+    || peer === "::1";
+  // A loopback proxy may supply the address; only cloudflared makes this header
+  // trustworthy. Never search later values when the first is missing or invalid.
   const first = (Array.isArray(connectingIp) ? connectingIp[0] : connectingIp)?.split(",", 1)[0].trim();
-  if (!loopback || !first || !isIP(first) || first.includes("%")) return peer;
-  // Canonicalize IPv6 so alternate spellings share the same budget.
-  return isIP(first) === 6 ? new URL(`http://[${first}]`).hostname.slice(1, -1) : first;
+  return registrationAddressKey(loopback && first && isIP(first) && !first.includes("%") ? first : peer);
 }
 
 function isSafeRedirect(value: string, allowlist: Set<string>): boolean {
@@ -210,9 +228,6 @@ export function createHttpServer(options: HttpServerOptions): Server {
       }
       if (req.method === "POST" && url.pathname === "/register") {
         const now = Date.now();
-        if (globalRegistrationAttempt.resetAt <= now) globalRegistrationAttempt = { count: 0, resetAt: now + registrationWindowMs };
-        if (globalRegistrationAttempt.count >= globalRegistrationLimit) return json(res, 429, { error: "too_many_requests" }, { "retry-after": String(Math.max(1, Math.ceil((globalRegistrationAttempt.resetAt - now) / 1000))) });
-        globalRegistrationAttempt.count += 1;
         const key = registrationClientKey(req.socket.remoteAddress, req.headers["cf-connecting-ip"]);
         let rate = registrationAttempts.get(key);
         if (!rate || rate.resetAt <= now) {
@@ -225,6 +240,9 @@ export function createHttpServer(options: HttpServerOptions): Server {
           registrationAttempts.set(key, rate);
         }
         if (rate.count >= registrationLimit) return json(res, 429, { error: "too_many_requests" }, { "retry-after": String(Math.max(1, Math.ceil((rate.resetAt - now) / 1000))) });
+        if (globalRegistrationAttempt.resetAt <= now) globalRegistrationAttempt = { count: 0, resetAt: now + registrationWindowMs };
+        if (globalRegistrationAttempt.count >= globalRegistrationLimit) return json(res, 429, { error: "too_many_requests" }, { "retry-after": String(Math.max(1, Math.ceil((globalRegistrationAttempt.resetAt - now) / 1000))) });
+        globalRegistrationAttempt.count += 1;
         rate.count += 1;
         const input = JSON.parse(await body(req)) as Record<string, unknown>;
         if (!Array.isArray(input.redirect_uris) || input.redirect_uris.length === 0 || input.redirect_uris.length > 10 || input.redirect_uris.some(item => typeof item !== "string" || !isSafeRedirect(item, redirectAllowlist))) return json(res, 400, { error: "invalid_redirect_uri" });
