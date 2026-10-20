@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm, copyFile } from "node:fs/promises";
+import { mkdtemp, rm, copyFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -207,59 +207,124 @@ end run
   }
 }
 
+// ── Timeouts ──
+// osascript runs are killed (SIGTERM, "exit null") when they exceed their timeout.
+// Saves of large documents need far longer than ordinary reads, so both limits are
+// overridable via environment variables.
+
+export const DEFAULT_JXA_TIMEOUT_MS = 30_000;
+export const DEFAULT_SAVE_TIMEOUT_MS = 120_000;
+
+/** Read a positive millisecond value from an env var, falling back to a default. */
+export function envTimeout(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+/** Timeout for ordinary JXA calls (IWORK_MCP_TIMEOUT_MS, default 30s). */
+export function jxaTimeout(): number {
+  return envTimeout("IWORK_MCP_TIMEOUT_MS", DEFAULT_JXA_TIMEOUT_MS);
+}
+
+/** Timeout for save operations (IWORK_MCP_SAVE_TIMEOUT_MS, default 120s). */
+export function saveTimeout(): number {
+  return envTimeout("IWORK_MCP_SAVE_TIMEOUT_MS", DEFAULT_SAVE_TIMEOUT_MS);
+}
+
+/** If `path` was modified at or after `sinceMs`, return a size+mtime signature; otherwise null. */
+async function writtenSince(path: string, sinceMs: number): Promise<string | null> {
+  try {
+    const s = await stat(path);
+    return s.mtimeMs >= sinceMs ? `${s.size}:${s.mtimeMs}` : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Creator Studio workaround for "Save As" (doc.save({in:}) hangs).
- * Copies the auto-saved iCloud file, then closes + reopens from the new path.
- * Returns the new document name.
+ *
+ * Uses `close saving yes saving in <path>`, which writes the file directly — it
+ * works for brand-new documents that have no auto-save file yet (the old
+ * copy-the-auto-save approach polled forever on those and got killed). The app
+ * sometimes writes the file but never replies to the Apple Event, so the target
+ * file is watched in parallel and the save counts as done once it is written and
+ * stable. The document is then reopened via LaunchServices (`open -a`), because
+ * JXA `app.open()` also never replies on Creator Studio.
+ * Returns the document name, and whether the app actually reopened it.
  */
 export async function creatorStudioSaveAs(
   appName: IWorkApp,
   documentName: string,
   targetPath: string,
-): Promise<string> {
-  // Get the auto-save path, close with save to flush changes, copy, and reopen
-  const autoSavePath = await runJXA<string>(
+): Promise<{ name: string; reopened: boolean }> {
+  const timeout = saveTimeout();
+  const start = Date.now();
+
+  const closing = runJXA<void>(
     `
     const app = Application("${resolveAppName(appName)}");
     const doc = app.documents.byName(params.documentName);
-    // Poll for file() to become available (auto-save can take a moment)
-    for (let i = 0; i < 15; i++) {
-      const f = doc.file();
-      if (f) return f.toString();
-      delay(1);
+    doc.close({ saving: "yes", savingIn: Path(params.targetPath) });
+    `,
+    { documentName, targetPath },
+    { timeout, label: "creatorStudioSaveAs:close" },
+  ).then(() => null, (err: unknown) => err);
+
+  // Wait for either the close to reply, or the file to be written and stable.
+  let lastSig: string | null = null;
+  let stableSince = 0;
+  for (;;) {
+    const done = await Promise.race([closing, sleep(500).then(() => undefined)]);
+    if (done !== undefined) {
+      if (await writtenSince(targetPath, start)) break; // a failed reply is fine if the file landed
+      throw done ?? new Error(`${appName} closed the document but did not write ${targetPath}`);
     }
-    throw new Error("Timed out waiting for document auto-save path");
-    `,
-    { documentName },
-    { timeout: 20_000, label: "creatorStudioSaveAs:getFile" },
-  );
+    const sig = await writtenSince(targetPath, start);
+    if (sig && sig === lastSig) {
+      if (Date.now() - stableSince >= 2_000) break;
+    } else {
+      lastSig = sig;
+      stableSince = Date.now();
+    }
+  }
 
-  // Close with saving:"yes" to flush all in-memory changes to the auto-save location
-  await runJXA<void>(
-    `
-    const app = Application("${resolveAppName(appName)}");
-    const doc = app.documents.byName(params.documentName);
-    doc.close({ saving: "yes" });
-    `,
-    { documentName },
-    { timeout: 10_000, label: "creatorStudioSaveAs:close" },
-  );
+  return reopenDocument(appName, targetPath);
+}
 
-  // Copy the saved file to the target path
-  await execFileAsync("/bin/cp", ["-R", autoSavePath, targetPath]);
+/** Open a saved file via LaunchServices and return its document name once the app has it. */
+async function reopenDocument(appName: IWorkApp, targetPath: string): Promise<{ name: string; reopened: boolean }> {
+  const fallbackName = basename(targetPath).replace(/\.(numbers|pages|key)$/i, "");
+  try {
+    await execFileAsync("/usr/bin/open", ["-g", "-a", resolveAppName(appName), targetPath], { timeout: 15_000 });
+    const name = await runJXA<string | null>(
+      `
+      const app = Application("${resolveAppName(appName)}");
+      const t0 = Date.now();
+      while (Date.now() - t0 < 15000) {
+        const docs = app.documents();
+        for (const d of docs) {
+          const f = d.file();
+          if (f && f.toString() === params.targetPath) return JSON.stringify(d.name());
+        }
+        delay(0.5);
+      }
+      return JSON.stringify(null);
+      `,
+      { targetPath },
+      { timeout: 25_000, label: "creatorStudioSaveAs:reopen" },
+    );
+    return name ? { name, reopened: true } : { name: fallbackName, reopened: false };
+  } catch {
+    // The file is saved; failing to reopen it must not turn the save into an error.
+    return { name: fallbackName, reopened: false };
+  }
+}
 
-  // Reopen from the new path
-  const newName = await runJXA<string>(
-    `
-    const app = Application("${resolveAppName(appName)}");
-    const newDoc = app.open(Path(params.targetPath));
-    return JSON.stringify(newDoc.name());
-    `,
-    { targetPath },
-    { label: "creatorStudioSaveAs:reopen" },
-  );
-
-  return newName;
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
@@ -423,7 +488,7 @@ export function runJXA<T = unknown>(
   params?: Record<string, unknown>,
   options?: RunJXAOptions,
 ): Promise<T> {
-  const timeout = options?.timeout ?? 30_000;
+  const timeout = options?.timeout ?? jxaTimeout();
   const maxBuffer = options?.maxBuffer ?? 10 * 1024 * 1024;
   const timing = process.env.IWORK_MCP_TIMING === "1";
   const t0 = timing ? Date.now() : 0;
@@ -453,6 +518,15 @@ function run(argv) {
 
       if (error) {
         const exitCode = typeof error.code === "number" ? error.code : null;
+        if (error.killed || error.signal) {
+          reject(new OsascriptError(
+            `${label} timed out after ${timeout}ms and osascript was killed (${error.signal ?? "SIGTERM"}). ` +
+            `Raise IWORK_MCP_TIMEOUT_MS (or IWORK_MCP_SAVE_TIMEOUT_MS for saves) if the app needs longer.` +
+            (stderr ? `\n${stderr}` : ""),
+            exitCode,
+          ));
+          return;
+        }
         reject(new OsascriptError(stderr || error.message, exitCode));
         return;
       }

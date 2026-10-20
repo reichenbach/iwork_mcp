@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioExportPDF, clickMenuItem, resolveAppName } from "../jxa.js";
+import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioExportPDF, saveTimeout, clickMenuItem, resolveAppName } from "../jxa.js";
 import { ANNOTATIONS } from "../annotations.js";
 
 function toolResult(text: string, isError = false) {
@@ -135,8 +135,10 @@ export function registerKeynoteTools(server: McpServer): void {
     async ({ documentName, filePath }) => handleJXA(async () => {
       if (isCreatorStudio()) {
         if (filePath) {
-          const newName = await creatorStudioSaveAs("Keynote", documentName, filePath);
-          return JSON.stringify({ saved: true, name: newName });
+          const { name, reopened } = await creatorStudioSaveAs("Keynote", documentName, filePath);
+          return JSON.stringify(reopened
+            ? { saved: true, name }
+            : { saved: true, name, reopened: false, note: `Saved, but Keynote did not reopen the file; open it with keynote_open_presentation if needed.` });
         }
         return JSON.stringify({ saved: true, name: documentName });
       }
@@ -152,7 +154,7 @@ export function registerKeynoteTools(server: McpServer): void {
         doc.save();
       }
       return JSON.stringify({ saved: true, name: doc.name() });
-    `, { documentName, filePath: filePath ?? null });
+    `, { documentName, filePath: filePath ?? null }, { timeout: saveTimeout(), label: "keynote:save" });
     }),
   );
 
