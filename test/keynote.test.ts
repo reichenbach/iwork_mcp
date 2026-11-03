@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { unlinkSync } from "node:fs";
+import { copyFileSync, unlinkSync } from "node:fs";
 import { createTestServer, type TestContext } from "./helpers/server.js";
 import { isAppAvailable } from "./helpers/app-check.js";
 import { runJXA } from "../src/jxa.js";
@@ -683,6 +683,33 @@ describe("Keynote Integration", async () => {
     const { json: after } = await call(ctx, "keynote_list_slides", { documentName: docName });
     assert.equal(after.length, before.length + 2, "No duplicate slides left behind");
     assert.deepEqual(after.slice(0, before.length).map((s: { title: string }) => s.title), before.map((s: { title: string }) => s.title));
+    await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber: before.length + 2 });
+    await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber: before.length + 1 });
+  });
+
+  it("keeps image slides apart when one file name is a prefix of another", async () => {
+    // Sizes no other test imports: Keynote stores identical images once per document
+    // and reports the first file name for every copy
+    const exportAt = async (maxSize: number) => {
+      const result = await ctx.client.callTool({ name: "keynote_export_slide_image", arguments: { documentName: docName, slideNumber: 1, maxSize } });
+      const { path } = JSON.parse((result.content as Array<{ text?: string }>)[1].text!);
+      tmpFiles.push(path);
+      return path as string;
+    };
+    const small = await exportAt(120);
+    const large = await exportAt(160);
+    const a = small.replace(/\.png$/, "-a.png");
+    const ab = small.replace(/\.png$/, "-ab.png");
+    copyFileSync(small, a);
+    copyFileSync(large, ab);
+    tmpFiles.push(a, ab);
+    const { json: before } = await call(ctx, "keynote_list_slides", { documentName: docName });
+
+    const { json, isError, text } = await call(ctx, "keynote_add_image_slides", { documentName: docName, filePaths: [a, ab] });
+    assert.ok(!isError, text);
+    assert.equal(json.added, 2);
+    const { json: after } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    assert.equal(after.length, before.length + 2);
     await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber: before.length + 2 });
     await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber: before.length + 1 });
   });
