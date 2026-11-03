@@ -540,13 +540,13 @@ describe("remote HTTP and OAuth", () => {
     } finally { await closeServer(supplemental); }
   });
 
-  it("initializes MCP and lists the same 117 tools over HTTP", async context => {
+  it("initializes MCP and lists the same 125 tools over HTTP", async context => {
     if (!requireSocket(context)) return;
     const client = new Client({ name: "http-test", version: "0.0.0" });
     const transport = new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`), { requestInit: { headers: { authorization: `Bearer ${accessToken}` } } });
     await client.connect(transport);
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 117);
+    assert.equal(tools.length, 125);
     await client.close();
   });
 });

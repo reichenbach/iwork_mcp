@@ -572,6 +572,128 @@ describe("Keynote Integration", async () => {
     }
   });
 
+  // ── Text boxes and items ──
+
+  it("adds, edits, formats, and deletes a text box", async () => {
+    const { json: added } = await call(ctx, "keynote_add_slide", { documentName: docName });
+    const slideNumber = added.slideNumber;
+
+    const { json: box, isError } = await call(ctx, "keynote_add_text_box", {
+      documentName: docName, slideNumber, text: "Free text", x: 100, y: 120, fontSize: 30, textColor: "#FF0000",
+    });
+    assert.ok(!isError && box.added);
+    assert.ok(Math.abs(box.x - 100) < 2 && Math.abs(box.y - 120) < 2);
+
+    const { json: info } = await call(ctx, "keynote_get_shape_info", {
+      documentName: docName, slideNumber, shapeIndex: box.textItemIndex, itemType: "textItem",
+    });
+    assert.equal(info.text, "Free text");
+    assert.equal(info.textFormat.size, 30);
+    // Keynote stores colors in its own color space, so they read back a few units off (#fb0207)
+    const rgb = (hex: string) => [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16));
+    rgb(info.textFormat.color).forEach((v, i) => assert.ok(Math.abs(v - rgb("#ff0000")[i]) <= 8, `color ${info.textFormat.color}`));
+
+    const { json: set } = await call(ctx, "keynote_set_item_text", {
+      documentName: docName, slideNumber, itemType: "textItem", itemIndex: box.textItemIndex, text: "Edited",
+    });
+    assert.equal(set.text, "Edited");
+
+    const { json: fmt } = await call(ctx, "keynote_format_shape", {
+      documentName: docName, slideNumber, shapeIndex: box.textItemIndex, itemType: "textItem",
+      format: { fontName: "HelveticaNeue-Bold" },
+    });
+    assert.deepEqual(fmt.applied, ["fontName"]);
+
+    const { json: del } = await call(ctx, "keynote_delete_item", {
+      documentName: docName, slideNumber, itemType: "textItem", itemIndex: box.textItemIndex,
+    });
+    assert.ok(del.deleted);
+    const { json: items } = await call(ctx, "keynote_list_slide_items", { documentName: docName, slideNumber });
+    assert.ok(!items.items.some((i: { text?: string }) => i.text === "Edited"));
+
+    await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber });
+  });
+
+  it("formats slide table cells, columns, and rows", async () => {
+    const { json: slides } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    const { json: tbl } = await call(ctx, "keynote_add_table_to_slide", {
+      documentName: docName, slideNumber: slides.length, data: [["A", "B"], [1, 2]],
+    });
+    assert.ok(tbl.added);
+    const { json: items } = await call(ctx, "keynote_list_slide_items", { documentName: docName, slideNumber: slides.length });
+    const tableIndex = (items.items as Array<{ type: string }>).filter(i => i.type === "table").length - 1;
+    const { json, isError, text } = await call(ctx, "keynote_format_slide_table", {
+      documentName: docName, slideNumber: slides.length, tableIndex, cellRange: "A1:B1",
+      format: { backgroundColor: "#003366", textColor: "#FFFFFF", fontName: "HelveticaNeue-Bold", fontSize: 14, alignment: "center", columnWidth: 120, rowHeight: 40 },
+    });
+    assert.ok(!isError, text);
+    assert.deepEqual(json.applied, ["textColor", "backgroundColor", "fontName", "fontSize", "alignment", "columnWidth", "rowHeight"]);
+  });
+
+  it("exports a single slide as an image", async () => {
+    const result = await ctx.client.callTool({ name: "keynote_export_slide_image", arguments: { documentName: docName, slideNumber: 1, maxSize: 400 } });
+    assert.ok(!result.isError, JSON.stringify(result.content));
+    const [image, meta] = result.content as Array<{ type: string; data?: string; text?: string }>;
+    assert.equal(image.type, "image");
+    assert.ok(image.data!.startsWith("iVBOR"), "Should be a PNG");
+    const { path } = JSON.parse(meta.text!);
+    tmpFiles.push(path);
+  });
+
+  it("adds a chart, locks and unlocks it, then deletes it", async () => {
+    const { json: slides } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    const slideNumber = slides.length;
+    const { json: chart, isError, text } = await call(ctx, "keynote_add_chart", {
+      documentName: docName, slideNumber, chartType: "line_2d",
+      rowNames: ["2025", "2026"], columnNames: ["Q1", "Q2", "Q3"], data: [[1, 2, 3], [4, 5, 6]],
+      x: 50, y: 60, width: 500, height: 300,
+    });
+    assert.ok(!isError, text);
+    assert.ok(Math.abs(chart.x - 50) < 2 && chart.width === 500);
+
+    const { json: lock } = await call(ctx, "keynote_set_item_locked", {
+      documentName: docName, slideNumber, itemType: "chart", itemIndex: chart.chartIndex, locked: true,
+    });
+    assert.equal(lock.locked, true);
+    const { json: items } = await call(ctx, "keynote_list_slide_items", { documentName: docName, slideNumber });
+    assert.ok(items.items.some((i: { type: string; locked?: boolean }) => i.type === "chart" && i.locked));
+    const lockedDelete = await call(ctx, "keynote_delete_item", { documentName: docName, slideNumber, itemType: "chart", itemIndex: chart.chartIndex });
+    assert.ok(lockedDelete.isError);
+    assert.match(lockedDelete.text, /locked/);
+
+    await call(ctx, "keynote_set_item_locked", { documentName: docName, slideNumber, itemType: "chart", itemIndex: chart.chartIndex, locked: false });
+    const { json: moved } = await call(ctx, "keynote_position_item", {
+      documentName: docName, slideNumber, itemType: "chart", itemIndex: chart.chartIndex, x: 200, y: 150, width: 400,
+    });
+    assert.ok(Math.abs(moved.x - 200) < 2 && Math.abs(moved.y - 150) < 2 && moved.width === 400);
+    const { json: del } = await call(ctx, "keynote_delete_item", { documentName: docName, slideNumber, itemType: "chart", itemIndex: chart.chartIndex });
+    assert.ok(del.deleted);
+  });
+
+  it("turns images into slides", async () => {
+    const result = await ctx.client.callTool({ name: "keynote_export_slide_image", arguments: { documentName: docName, slideNumber: 1, maxSize: 200 } });
+    const { path } = JSON.parse((result.content as Array<{ text?: string }>)[1].text!);
+    tmpFiles.push(path);
+    const { json: before } = await call(ctx, "keynote_list_slides", { documentName: docName });
+
+    const { json, isError, text } = await call(ctx, "keynote_add_image_slides", { documentName: docName, filePaths: [path, path], setTitles: true });
+    assert.ok(!isError, text);
+    assert.equal(json.added, 2);
+    assert.equal(json.firstSlideNumber, before.length + 1);
+    const { json: after } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    assert.equal(after.length, before.length + 2, "No duplicate slides left behind");
+    assert.deepEqual(after.slice(0, before.length).map((s: { title: string }) => s.title), before.map((s: { title: string }) => s.title));
+    await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber: before.length + 2 });
+    await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber: before.length + 1 });
+  });
+
+  it("lists transition effects", async () => {
+    const { json, isError } = await call(ctx, "keynote_list_transition_effects");
+    assert.ok(!isError);
+    assert.ok(json.effects.includes("dissolve"));
+    assert.ok(json.effects.includes("no transition effect"));
+  });
+
   // ── Export to PDF ──
 
   it("exports to PDF", async () => {

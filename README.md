@@ -1,6 +1,6 @@
 # iwork-mcp
 
-An agent-neutral MCP server for automating Numbers, Pages, and Keynote on macOS. It exposes 117 tools over local stdio or authenticated Streamable HTTP.
+An agent-neutral MCP server for automating Numbers, Pages, and Keynote on macOS. It exposes 125 tools over local stdio or authenticated Streamable HTTP.
 
 ![Numbers dashboard](screenshots/numbers-dashboard.jpg)
 
@@ -8,7 +8,7 @@ An agent-neutral MCP server for automating Numbers, Pages, and Keynote on macOS.
 
 - Numbers: create spreadsheets, read and write cells and ranges, use formulas, format tables, add charts, and export to PDF, spreadsheet, or CSV formats.
 - Pages: create and format documents, edit paragraphs, insert images and tables, and export to PDF, document, EPUB, or text formats.
-- Keynote: create and edit presentations, lay out slide items, add presenter notes and transitions, and export to PDF, presentation, HTML, or image formats.
+- Keynote: create and edit presentations, add and edit text boxes and charts, lay out slide items, add presenter notes and transitions, preview single slides, and export to PDF, presentation, HTML, or image formats.
 
 Requirements: macOS 13 or newer, current iWork applications, and Node.js 18 or newer. macOS asks for Automation permission on first use.
 
@@ -160,7 +160,7 @@ curl -i -X POST http://127.0.0.1:8787/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"review","version":"1"}}}'
 ```
 
-Copy the `mcp-session-id` response header, send an `notifications/initialized` notification, then call `tools/list` with the same bearer token and session header. The automated test performs this complete sequence and verifies that HTTP returns the same 117 tools as stdio.
+Copy the `mcp-session-id` response header, send an `notifications/initialized` notification, then call `tools/list` with the same bearer token and session header. The automated test performs this complete sequence and verifies that HTTP returns the same 125 tools as stdio.
 
 ## Security and limitations
 
