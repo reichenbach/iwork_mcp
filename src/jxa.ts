@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm, copyFile } from "node:fs/promises";
+import { mkdtemp, rm, copyFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -207,6 +207,55 @@ end run
   }
 }
 
+// Documents this server created that haven't been saved to a user path yet
+const createdDocuments = new Set<string>();
+
+/** Record a document created by a tool, so its untitled auto-save can be cleaned up. */
+export function rememberCreatedDocument(appName: IWorkApp, name: string): void {
+  createdDocuments.add(createdKey(appName, name));
+}
+
+function createdKey(appName: IWorkApp, name: string): string {
+  const ext = EXT_MAP[appName];
+  return `${appName}:${name.endsWith(ext) ? name.slice(0, -ext.length) : name}`;
+}
+
+/** The iCloud auto-save of a document a tool created, or null. */
+export async function untitledAutoSavePath(appName: IWorkApp, documentName: string): Promise<string | null> {
+  if (!createdDocuments.has(createdKey(appName, documentName))) return null;
+  const path = await runJXA<string | null>(
+    `
+    const f = Application("${resolveAppName(appName)}").documents.byName(params.documentName).file();
+    return JSON.stringify(f ? f.toString() : null);
+    `,
+    { documentName },
+    { label: "untitledAutoSavePath" },
+  ).catch(() => null);
+  return path && path.includes("/Library/Mobile Documents/") ? path : null;
+}
+
+/** Move a tool-created document's untitled auto-save to the Trash once no open document uses it. */
+export async function trashUntitledAutoSave(appName: IWorkApp, documentName: string, path: string): Promise<void> {
+  createdDocuments.delete(createdKey(appName, documentName));
+  // Waiting first, or Keynote may report the document can't be opened
+  await runJXA<void>(
+    `
+    ObjC.import("Foundation");
+    const app = Application("${resolveAppName(appName)}");
+    function inUse() {
+      return app.documents().some(function (d) {
+        try { const f = d.file(); return f && f.toString() === params.path; } catch (e) { return false; }
+      });
+    }
+    for (let i = 0; i < 10 && inUse(); i++) delay(0.5);
+    if (inUse()) return;
+    $.NSFileManager.defaultManager.trashItemAtURLResultingItemURLError($.NSURL.fileURLWithPath(params.path), null, null);
+    `,
+    { path },
+    { label: "trashUntitledAutoSave" },
+  ).catch(() => {});
+}
+
 /**
  * Creator Studio workaround for "Save As" (doc.save({in:}) hangs).
  * Copies the auto-saved iCloud file, then closes + reopens from the new path.
@@ -259,6 +308,11 @@ export async function creatorStudioSaveAs(
     { label: "creatorStudioSaveAs:reopen" },
   );
 
+  // Untitled documents are auto-saved to iCloud before Save As; don't leave that copy behind
+  if (createdDocuments.has(createdKey(appName, documentName)) && autoSavePath.includes("/Library/Mobile Documents/") && autoSavePath !== targetPath) {
+    await trashUntitledAutoSave(appName, documentName, autoSavePath);
+  }
+
   return newName;
 }
 
@@ -302,6 +356,72 @@ export async function creatorStudioExportPDF(
     }
 
     await copyFile(pdfPath, targetPath);
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Creator Studio PDF export for Keynote (Quick Look renders only one blank page for .key).
+ * Tries the native export, then falls back to slide images assembled with PDFKit (raster pages).
+ */
+export async function creatorStudioKeynoteExportPDF(
+  documentName: string,
+  targetPath: string,
+): Promise<{ method: "native" | "slide images"; pageCount?: number }> {
+  const mtimeBefore = existsSync(targetPath) ? (await stat(targetPath)).mtimeMs : -1;
+  try {
+    await runJXA<void>(
+      `
+      const app = Application("Keynote");
+      app.export(app.documents.byName(params.documentName), { to: Path(params.targetPath), as: "PDF" });
+      `,
+      { documentName, targetPath },
+      { timeout: 60_000, label: "creatorStudioKeynoteExportPDF:native" },
+    );
+    if (existsSync(targetPath) && (await stat(targetPath)).mtimeMs > mtimeBefore) return { method: "native" };
+  } catch {}
+
+  // Next to the target: the sandboxed app may not be able to write to $TMPDIR
+  const tmpDir = await mkdtemp(join(dirname(targetPath), ".iwork-mcp-export-"));
+  try {
+    await runJXA<void>(
+      `
+      const app = Application("Keynote");
+      const doc = app.documents.byName(params.documentName);
+      // No imageFormat: JXA can't pass that enum (-1700), and PNG is the default
+      app.export(doc, { to: Path(params.folder), as: "slide images", withProperties: { skippedSlides: false } });
+      `,
+      { documentName, folder: join(tmpDir, "slides") },
+      { timeout: 120_000, label: "creatorStudioKeynoteExportPDF:images" },
+    );
+
+    const { stdout } = await execFileAsync("/usr/bin/find", [tmpDir, "-type", "f"]);
+    const images = stdout
+      .split("\n")
+      .filter((f) => /\.(png|jpe?g|tiff?)$/i.test(f))
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    if (images.length === 0) {
+      throw new Error("Keynote did not export any slide images");
+    }
+
+    const pageCount = await runJXA<number>(
+      `
+      ObjC.import("AppKit");
+      ObjC.import("Quartz");
+      const pdf = $.PDFDocument.alloc.init;
+      for (let i = 0; i < params.images.length; i++) {
+        const img = $.NSImage.alloc.initWithContentsOfFile(params.images[i]);
+        if (!img || img.isNil()) throw new Error("Could not read exported slide image " + params.images[i]);
+        pdf.insertPageAtIndex($.PDFPage.alloc.initWithImage(img), i);
+      }
+      if (!pdf.writeToFile(params.targetPath)) throw new Error("Could not write PDF to " + params.targetPath);
+      return JSON.stringify(Number(pdf.pageCount));
+      `,
+      { images, targetPath },
+      { timeout: 60_000, label: "creatorStudioKeynoteExportPDF:assemble" },
+    );
+    return { method: "slide images", pageCount };
   } finally {
     await rm(tmpDir, { recursive: true, force: true });
   }
