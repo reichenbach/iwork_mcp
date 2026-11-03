@@ -1128,11 +1128,16 @@ export function registerKeynoteTools(server: McpServer): void {
 
       function baseName(p) { return String(p).split("/").pop(); }
       function stem(n) { return n.replace(/\\.[^.]*$/, ""); }
-      // Keynote may rename an imported copy (e.g. "photo 2.png"): match on the file stem
+      // Keynote may rename an imported copy (e.g. "photo 2.png"): match on the file stem.
+      // Exact match first, then the longest prefix, so "ab.png" never matches "a.png".
       function fileFor(imageName) {
-        return Object.keys(wanted).find(function (k) {
-          return stem(imageName) === stem(k) || stem(imageName).indexOf(stem(k)) === 0;
-        });
+        const s = stem(imageName);
+        const keys = Object.keys(wanted);
+        const exact = keys.find(function (k) { return stem(k) === s; });
+        if (exact) return exact;
+        return keys
+          .filter(function (k) { return s.indexOf(stem(k)) === 0; })
+          .sort(function (a, b) { return stem(b).length - stem(a).length; })[0];
       }
       const wanted = {};
       params.filePaths.forEach(function (p) { const n = baseName(p); wanted[n] = (wanted[n] || 0) + 1; });
