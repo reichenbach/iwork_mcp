@@ -20,9 +20,9 @@ describe("Tool Registration", () => {
     assert.ok(instructions.includes("iWork"), "Instructions should mention iWork");
   });
 
-  it("registers all 117 tools", async () => {
+  it("registers all 125 tools", async () => {
     const { tools } = await ctx.client.listTools();
-    assert.equal(tools.length, 117);
+    assert.equal(tools.length, 125);
   });
 
   it("registers 50 Numbers tools", async () => {
@@ -37,10 +37,10 @@ describe("Tool Registration", () => {
     assert.equal(pages.length, 26);
   });
 
-  it("registers 41 Keynote tools", async () => {
+  it("registers 49 Keynote tools", async () => {
     const { tools } = await ctx.client.listTools();
     const keynote = tools.filter((t) => t.name.startsWith("keynote_"));
-    assert.equal(keynote.length, 41);
+    assert.equal(keynote.length, 49);
   });
 
   it("every tool has a description", async () => {
@@ -138,6 +138,14 @@ describe("Tool Registration", () => {
       "keynote_position_item",
       "keynote_align_items",
       "keynote_distribute_items",
+      "keynote_add_text_box",
+      "keynote_set_item_text",
+      "keynote_delete_item",
+      "keynote_export_slide_image",
+      "keynote_list_transition_effects",
+      "keynote_add_chart",
+      "keynote_add_image_slides",
+      "keynote_set_item_locked",
       "keynote_get_shape_info",
       "keynote_format_shape",
       "keynote_set_slide_layout",

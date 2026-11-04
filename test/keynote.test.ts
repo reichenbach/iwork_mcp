@@ -1,8 +1,9 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { unlinkSync } from "node:fs";
+import { copyFileSync, unlinkSync } from "node:fs";
 import { createTestServer, type TestContext } from "./helpers/server.js";
 import { isAppAvailable } from "./helpers/app-check.js";
+import { runJXA } from "../src/jxa.js";
 
 async function call(ctx: TestContext, name: string, args: Record<string, unknown> = {}) {
   const result = await ctx.client.callTool({ name, arguments: args });
@@ -27,6 +28,16 @@ describe("Keynote Integration", async () => {
   before(async () => {
     ctx = await createTestServer();
   });
+
+  // Layout and theme names are localized (e.g. "Leer" instead of "Blank" in German)
+  async function layoutNames(): Promise<string[]> {
+    const { json } = await call(ctx, "keynote_list_master_slides", { documentName: docName });
+    return (json as Array<{ name: string }>).map(l => l.name);
+  }
+  async function blankLayout(): Promise<string | undefined> {
+    const names = await layoutNames();
+    return names.find(n => ["Blank", "Leer", "Vide", "Vacío", "Vuoto", "Leeg", "Em branco", "空白"].includes(n));
+  }
 
   after(async () => {
     if (ctx) {
@@ -145,6 +156,7 @@ describe("Keynote Integration", async () => {
     });
     assert.ok(json.duplicated);
     assert.equal(json.totalSlides, countBefore + 1);
+    assert.equal(json.slideNumber, json.totalSlides);
 
     // Clean up: delete the duplicate
     await call(ctx, "keynote_delete_slide", {
@@ -180,6 +192,98 @@ describe("Keynote Integration", async () => {
     assert.equal(content.title, "Slide B");
   });
 
+  it("reorders a slide forward without losing the target slide", async () => {
+    const { json: before } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    assert.ok(before.length >= 3);
+    for (let i = 1; i <= 3; i++) {
+      await call(ctx, "keynote_set_slide_title", { documentName: docName, slideNumber: i, title: `Order ${i}` });
+    }
+
+    const { json, isError } = await call(ctx, "keynote_reorder_slide", {
+      documentName: docName,
+      fromSlideNumber: 1,
+      toSlideNumber: 3,
+    });
+    assert.ok(!isError && json.moved);
+
+    const { json: after } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    assert.equal(after.length, before.length);
+    assert.deepEqual(after.slice(0, 3).map((s: { title: string }) => s.title), ["Order 2", "Order 3", "Order 1"]);
+  });
+
+  it("adds a slide after a given slide", async () => {
+    const { json: before } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    const { json, isError } = await call(ctx, "keynote_add_slide", { documentName: docName, afterSlide: 1 });
+    assert.ok(!isError && json.added);
+    assert.equal(json.slideNumber, 2);
+    assert.equal(json.totalSlides, before.length + 1);
+
+    const { json: after } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    assert.equal(after.length, before.length + 1);
+    assert.equal(after[2].title, before[1].title, "Former slide 2 should now be slide 3");
+    await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber: 2 });
+  });
+
+  it("adds a slide with a master layout after a given slide", async () => {
+    const { json: before } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    const layout = (await layoutNames()).pop();
+    const { json, isError } = await call(ctx, "keynote_add_slide", {
+      documentName: docName, masterSlideName: layout, afterSlide: 1,
+    });
+    assert.ok(!isError && json.added);
+    assert.equal(json.slideNumber, 2);
+
+    const { json: after } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    assert.equal(after.length, before.length + 1);
+    await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber: 2 });
+  });
+
+  it("reports an error for an unknown master layout or document", async () => {
+    const { json: before } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    const badMaster = await call(ctx, "keynote_add_slide", {
+      documentName: docName, masterSlideName: "NoSuchLayout", afterSlide: 1,
+    });
+    assert.ok(badMaster.isError);
+    const badDoc = await call(ctx, "keynote_add_slide", {
+      documentName: `NoSuchDocument-${suffix}`, masterSlideName: "Blank",
+    });
+    assert.ok(badDoc.isError);
+
+    const { json: after } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    assert.equal(after.length, before.length);
+  });
+
+  it("duplicates a slide to a given position", async () => {
+    await call(ctx, "keynote_set_slide_title", { documentName: docName, slideNumber: 2, title: "Dup source" });
+    const { json: before } = await call(ctx, "keynote_list_slides", { documentName: docName });
+
+    const { json, isError } = await call(ctx, "keynote_duplicate_slide", {
+      documentName: docName, slideNumber: 2, toSlideNumber: 1,
+    });
+    assert.ok(!isError && json.duplicated);
+    assert.equal(json.slideNumber, 1);
+
+    const { json: after } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    assert.equal(after.length, before.length + 1);
+    assert.equal(after[0].title, "Dup source");
+    await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber: 1 });
+  });
+
+  it("creates a presentation with a custom slide size", async () => {
+    const { json, isError } = await call(ctx, "keynote_create_presentation", { width: 1920, height: 1080 });
+    assert.ok(!isError, "create with size should succeed");
+    assert.equal(json.width, 1920);
+    assert.equal(json.height, 1080);
+    await call(ctx, "keynote_close_presentation", { documentName: json.name, saving: "no" });
+  });
+
+  it("lists each text box on a slide only once", async () => {
+    await call(ctx, "keynote_set_slide_title", { documentName: docName, slideNumber: 1, title: "Unique title" });
+    const { json: content } = await call(ctx, "keynote_get_slide_content", { documentName: docName, slideNumber: 1 });
+    const matches = [...content.textItems, ...content.shapes].filter((t: { text: string }) => t.text === "Unique title");
+    assert.ok(matches.length <= 1, `Title listed ${matches.length} times`);
+  });
+
   // ── Layout tools ──
 
   it("positions a shape on a slide", async () => {
@@ -189,10 +293,12 @@ describe("Keynote Integration", async () => {
     const layoutSlide = slides.length;
 
     // Add 3 shapes with known positions
-    await call(ctx, "keynote_add_shape", {
+    const { json: added } = await call(ctx, "keynote_add_shape", {
       documentName: docName, slideNumber: layoutSlide, text: "Shape A",
       x: 50, y: 50, width: 100, height: 80,
     });
+    assert.ok(Math.abs(added.x - 50) < 2, `Expected x~50, got ${added.x}`);
+    assert.ok(Math.abs(added.y - 50) < 2, `Expected y~50, got ${added.y}`);
 
     // Position the shape we just added (index 0 on this fresh slide)
     const { json } = await call(ctx, "keynote_position_item", {
@@ -274,9 +380,10 @@ describe("Keynote Integration", async () => {
       documentName: docName,
       slideNumber: fmtSlide,
       shapeIndex: 0,
-      format: { opacity: 75, rotation: 15, fontName: "HelveticaNeue-Bold", fontSize: 18 },
+      format: { opacity: 75, rotation: 15, fontName: "HelveticaNeue-Bold", fontSize: 18, textColor: "#FFFFFF" },
     });
     assert.ok(fmtResult.formatted);
+    assert.deepEqual(fmtResult.applied, ["opacity", "rotation", "fontName", "fontSize", "textColor"]);
 
     // Verify
     const { json: after } = await call(ctx, "keynote_get_shape_info", {
@@ -286,6 +393,14 @@ describe("Keynote Integration", async () => {
     });
     assert.equal(after.opacity, 75);
     assert.equal(after.rotation, 15);
+    assert.equal(after.textFormat.color, "#ffffff", "White text must not come out near-black");
+
+    // Text alignment isn't scriptable: reject it instead of half-applying the format
+    const { isError } = await call(ctx, "keynote_format_shape", {
+      documentName: docName, slideNumber: fmtSlide, shapeIndex: 0,
+      format: { opacity: 50, textAlignment: "center" },
+    });
+    assert.ok(isError);
   });
 
   // ── Theme tools ──
@@ -296,7 +411,8 @@ describe("Keynote Integration", async () => {
     assert.ok(before.theme, "Should return a theme name");
 
     // Change to a different theme
-    const targetTheme = before.theme === "Black" ? "White" : "Black";
+    const { json: themes } = await call(ctx, "keynote_list_themes");
+    const targetTheme = (themes as string[]).find(t => t !== before.theme);
     const { json: setResult } = await call(ctx, "keynote_set_theme", {
       documentName: docName,
       themeName: targetTheme,
@@ -312,13 +428,14 @@ describe("Keynote Integration", async () => {
   // ── Slide layout ──
 
   it("changes a slide layout", async () => {
+    const layout = (await blankLayout()) ?? (await layoutNames()).pop();
     const { json } = await call(ctx, "keynote_set_slide_layout", {
       documentName: docName,
       slideNumber: 1,
-      masterSlideName: "Blank",
+      masterSlideName: layout,
     });
     assert.ok(json.layoutSet);
-    assert.equal(json.masterSlide, "Blank");
+    assert.equal(json.masterSlide, layout);
   });
 
   // ── Slide tables ──
@@ -455,6 +572,155 @@ describe("Keynote Integration", async () => {
     }
   });
 
+  // ── Text boxes and items ──
+
+  it("adds, edits, formats, and deletes a text box", async () => {
+    const { json: added } = await call(ctx, "keynote_add_slide", { documentName: docName });
+    const slideNumber = added.slideNumber;
+
+    const { json: box, isError } = await call(ctx, "keynote_add_text_box", {
+      documentName: docName, slideNumber, text: "Free text", x: 100, y: 120, fontSize: 30, textColor: "#FF0000",
+    });
+    assert.ok(!isError && box.added);
+    assert.ok(Math.abs(box.x - 100) < 2 && Math.abs(box.y - 120) < 2);
+
+    const { json: info } = await call(ctx, "keynote_get_shape_info", {
+      documentName: docName, slideNumber, shapeIndex: box.textItemIndex, itemType: "textItem",
+    });
+    assert.equal(info.text, "Free text");
+    assert.equal(info.textFormat.size, 30);
+    // Keynote stores colors in its own color space, so they read back a few units off (#fb0207)
+    const rgb = (hex: string) => [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16));
+    rgb(info.textFormat.color).forEach((v, i) => assert.ok(Math.abs(v - rgb("#ff0000")[i]) <= 8, `color ${info.textFormat.color}`));
+
+    const { json: set } = await call(ctx, "keynote_set_item_text", {
+      documentName: docName, slideNumber, itemType: "textItem", itemIndex: box.textItemIndex, text: "Edited",
+    });
+    assert.equal(set.text, "Edited");
+
+    const { json: fmt } = await call(ctx, "keynote_format_shape", {
+      documentName: docName, slideNumber, shapeIndex: box.textItemIndex, itemType: "textItem",
+      format: { fontName: "HelveticaNeue-Bold" },
+    });
+    assert.deepEqual(fmt.applied, ["fontName"]);
+
+    const { json: del } = await call(ctx, "keynote_delete_item", {
+      documentName: docName, slideNumber, itemType: "textItem", itemIndex: box.textItemIndex,
+    });
+    assert.ok(del.deleted);
+    const { json: items } = await call(ctx, "keynote_list_slide_items", { documentName: docName, slideNumber });
+    assert.ok(!items.items.some((i: { text?: string }) => i.text === "Edited"));
+
+    await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber });
+  });
+
+  it("formats slide table cells, columns, and rows", async () => {
+    const { json: slides } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    const { json: tbl } = await call(ctx, "keynote_add_table_to_slide", {
+      documentName: docName, slideNumber: slides.length, data: [["A", "B"], [1, 2]],
+    });
+    assert.ok(tbl.added);
+    const { json: items } = await call(ctx, "keynote_list_slide_items", { documentName: docName, slideNumber: slides.length });
+    const tableIndex = (items.items as Array<{ type: string }>).filter(i => i.type === "table").length - 1;
+    const { json, isError, text } = await call(ctx, "keynote_format_slide_table", {
+      documentName: docName, slideNumber: slides.length, tableIndex, cellRange: "A1:B1",
+      format: { backgroundColor: "#003366", textColor: "#FFFFFF", fontName: "HelveticaNeue-Bold", fontSize: 14, alignment: "center", columnWidth: 120, rowHeight: 40 },
+    });
+    assert.ok(!isError, text);
+    assert.deepEqual(json.applied, ["textColor", "backgroundColor", "fontName", "fontSize", "alignment", "columnWidth", "rowHeight"]);
+  });
+
+  it("exports a single slide as an image", async () => {
+    const result = await ctx.client.callTool({ name: "keynote_export_slide_image", arguments: { documentName: docName, slideNumber: 1, maxSize: 400 } });
+    assert.ok(!result.isError, JSON.stringify(result.content));
+    const [image, meta] = result.content as Array<{ type: string; data?: string; text?: string }>;
+    assert.equal(image.type, "image");
+    assert.ok(image.data!.startsWith("iVBOR"), "Should be a PNG");
+    const { path } = JSON.parse(meta.text!);
+    tmpFiles.push(path);
+  });
+
+  it("adds a chart, locks and unlocks it, then deletes it", async () => {
+    const { json: slides } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    const slideNumber = slides.length;
+    const { json: chart, isError, text } = await call(ctx, "keynote_add_chart", {
+      documentName: docName, slideNumber, chartType: "line_2d",
+      rowNames: ["2025", "2026"], columnNames: ["Q1", "Q2", "Q3"], data: [[1, 2, 3], [4, 5, 6]],
+      x: 50, y: 60, width: 500, height: 300,
+    });
+    assert.ok(!isError, text);
+    assert.ok(Math.abs(chart.x - 50) < 2 && chart.width === 500);
+
+    const { json: lock } = await call(ctx, "keynote_set_item_locked", {
+      documentName: docName, slideNumber, itemType: "chart", itemIndex: chart.chartIndex, locked: true,
+    });
+    assert.equal(lock.locked, true);
+    const { json: items } = await call(ctx, "keynote_list_slide_items", { documentName: docName, slideNumber });
+    assert.ok(items.items.some((i: { type: string; locked?: boolean }) => i.type === "chart" && i.locked));
+    const lockedDelete = await call(ctx, "keynote_delete_item", { documentName: docName, slideNumber, itemType: "chart", itemIndex: chart.chartIndex });
+    assert.ok(lockedDelete.isError);
+    assert.match(lockedDelete.text, /locked/);
+
+    await call(ctx, "keynote_set_item_locked", { documentName: docName, slideNumber, itemType: "chart", itemIndex: chart.chartIndex, locked: false });
+    const { json: moved } = await call(ctx, "keynote_position_item", {
+      documentName: docName, slideNumber, itemType: "chart", itemIndex: chart.chartIndex, x: 200, y: 150, width: 400,
+    });
+    assert.ok(Math.abs(moved.x - 200) < 2 && Math.abs(moved.y - 150) < 2 && moved.width === 400);
+    const { json: del } = await call(ctx, "keynote_delete_item", { documentName: docName, slideNumber, itemType: "chart", itemIndex: chart.chartIndex });
+    assert.ok(del.deleted);
+  });
+
+  it("turns images into slides", async () => {
+    const result = await ctx.client.callTool({ name: "keynote_export_slide_image", arguments: { documentName: docName, slideNumber: 1, maxSize: 200 } });
+    const { path } = JSON.parse((result.content as Array<{ text?: string }>)[1].text!);
+    tmpFiles.push(path);
+    const { json: before } = await call(ctx, "keynote_list_slides", { documentName: docName });
+
+    const { json, isError, text } = await call(ctx, "keynote_add_image_slides", { documentName: docName, filePaths: [path, path], setTitles: true });
+    assert.ok(!isError, text);
+    assert.equal(json.added, 2);
+    assert.equal(json.firstSlideNumber, before.length + 1);
+    const { json: after } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    assert.equal(after.length, before.length + 2, "No duplicate slides left behind");
+    assert.deepEqual(after.slice(0, before.length).map((s: { title: string }) => s.title), before.map((s: { title: string }) => s.title));
+    await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber: before.length + 2 });
+    await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber: before.length + 1 });
+  });
+
+  it("keeps image slides apart when one file name is a prefix of another", async () => {
+    // Sizes no other test imports: Keynote stores identical images once per document
+    // and reports the first file name for every copy
+    const exportAt = async (maxSize: number) => {
+      const result = await ctx.client.callTool({ name: "keynote_export_slide_image", arguments: { documentName: docName, slideNumber: 1, maxSize } });
+      const { path } = JSON.parse((result.content as Array<{ text?: string }>)[1].text!);
+      tmpFiles.push(path);
+      return path as string;
+    };
+    const small = await exportAt(120);
+    const large = await exportAt(160);
+    const a = small.replace(/\.png$/, "-a.png");
+    const ab = small.replace(/\.png$/, "-ab.png");
+    copyFileSync(small, a);
+    copyFileSync(large, ab);
+    tmpFiles.push(a, ab);
+    const { json: before } = await call(ctx, "keynote_list_slides", { documentName: docName });
+
+    const { json, isError, text } = await call(ctx, "keynote_add_image_slides", { documentName: docName, filePaths: [a, ab] });
+    assert.ok(!isError, text);
+    assert.equal(json.added, 2);
+    const { json: after } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    assert.equal(after.length, before.length + 2);
+    await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber: before.length + 2 });
+    await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber: before.length + 1 });
+  });
+
+  it("lists transition effects", async () => {
+    const { json, isError } = await call(ctx, "keynote_list_transition_effects");
+    assert.ok(!isError);
+    assert.ok(json.effects.includes("dissolve"));
+    assert.ok(json.effects.includes("no transition effect"));
+  });
+
   // ── Export to PDF ──
 
   it("exports to PDF", async () => {
@@ -467,9 +733,67 @@ describe("Keynote Integration", async () => {
     });
     assert.ok(json.exported);
     assert.equal(json.format, "PDF");
+
+    // One PDF page per (non-skipped) slide — Creator Studio used to produce a single blank page
+    const { json: slides } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    const expected = (slides as Array<{ skipped: boolean }>).filter(s => !s.skipped).length;
+    const pageCount = await runJXA<number>(`
+      ObjC.import("Quartz");
+      const pdf = $.PDFDocument.alloc.initWithURL($.NSURL.fileURLWithPath(params.path));
+      return JSON.stringify(Number(pdf.pageCount));
+    `, { path: tmpPath });
+    assert.equal(pageCount, expected);
   });
 
   // ── Error on nonexistent presentation ──
+
+  it("returns isError when reading a missing slide or presentation", async () => {
+    for (const tool of ["keynote_get_slide_content", "keynote_list_slide_items"]) {
+      const missingSlide = await call(ctx, tool, { documentName: docName, slideNumber: 99 });
+      assert.ok(missingSlide.isError, `${tool} should fail for slide 99`);
+      const missingDoc = await call(ctx, tool, { documentName: "NoSuchPresentation_999", slideNumber: 1 });
+      assert.ok(missingDoc.isError, `${tool} should fail for a missing presentation`);
+    }
+  });
+
+  it("returns isError when saving a nonexistent presentation", async () => {
+    const { isError } = await call(ctx, "keynote_save_presentation", { documentName: "NoSuchPresentation_999" });
+    assert.ok(isError);
+  });
+
+  it("lists each box once in list_slide_items", async () => {
+    const { json } = await call(ctx, "keynote_list_slide_items", { documentName: docName, slideNumber: 1 });
+    const keys = (json.items as Array<{ type: string; text?: string; width: number; height: number; position: { x: number; y: number } | null }>)
+      .filter(i => i.type === "shape" || i.type === "textItem")
+      .map(i => [i.text, Math.round(i.width), Math.round(i.height), i.position && Math.round(i.position.x), i.position && Math.round(i.position.y)].join("|"));
+    assert.equal(new Set(keys).size, keys.length, "No box should be listed twice");
+  });
+
+  it("makes a hidden title placeholder visible when setting a title", async (t) => {
+    const blank = await blankLayout();
+    if (!blank) return t.skip("no blank layout in this theme");
+    const { json: added } = await call(ctx, "keynote_add_slide", { documentName: docName, masterSlideName: blank });
+    const { json, isError, text } = await call(ctx, "keynote_set_slide_title", {
+      documentName: docName, slideNumber: added.slideNumber, title: "Visible title",
+    });
+    if (!isError) {
+      const { json: slides } = await call(ctx, "keynote_list_slides", { documentName: docName });
+      assert.notEqual(slides[added.slideNumber - 1].titleShowing, false, "Title was written but is hidden");
+      assert.equal(slides[added.slideNumber - 1].title, "Visible title");
+    } else {
+      assert.match(text, /no visible title placeholder/);
+    }
+    assert.ok(isError || json.set);
+    await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber: added.slideNumber });
+  });
+
+  it("accepts 'none' as a transition and explains invalid effect names", async () => {
+    const { json, isError } = await call(ctx, "keynote_set_transition", { documentName: docName, slideNumber: 1, effect: "none" });
+    assert.ok(!isError && json.set);
+    const bad = await call(ctx, "keynote_set_transition", { documentName: docName, slideNumber: 1, effect: "NoSuchEffect" });
+    assert.ok(bad.isError);
+    assert.match(bad.text, /Valid effects: .*dissolve/);
+  });
 
   it("returns isError for a nonexistent presentation", async () => {
     const result = await ctx.client.callTool({

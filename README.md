@@ -1,6 +1,6 @@
 # iwork-mcp
 
-An agent-neutral MCP server for automating Numbers, Pages, and Keynote on macOS. It exposes 117 tools over local stdio or authenticated Streamable HTTP.
+An agent-neutral MCP server for automating Numbers, Pages, and Keynote on macOS. It exposes 125 tools over local stdio or authenticated Streamable HTTP.
 
 ![Numbers dashboard](screenshots/numbers-dashboard.jpg)
 
@@ -8,7 +8,7 @@ An agent-neutral MCP server for automating Numbers, Pages, and Keynote on macOS.
 
 - Numbers: create spreadsheets, read and write cells and ranges, use formulas, format tables, add charts, and export to PDF, spreadsheet, or CSV formats.
 - Pages: create and format documents, edit paragraphs, insert images and tables, and export to PDF, document, EPUB, or text formats.
-- Keynote: create and edit presentations, lay out slide items, add presenter notes and transitions, and export to PDF, presentation, HTML, or image formats.
+- Keynote: create and edit presentations, add and edit text boxes and charts, lay out slide items, add presenter notes and transitions, preview single slides, and export to PDF, presentation, HTML, or image formats.
 
 Requirements: macOS 13 or newer, current iWork applications, and Node.js 18 or newer. macOS asks for Automation permission on first use.
 
@@ -162,11 +162,12 @@ curl -i -X POST http://127.0.0.1:8787/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"review","version":"1"}}}'
 ```
 
-Copy the `mcp-session-id` response header, send an `notifications/initialized` notification, then call `tools/list` with the same bearer token and session header. The automated test performs this complete sequence and verifies that HTTP returns the same 117 tools as stdio.
+Copy the `mcp-session-id` response header, send an `notifications/initialized` notification, then call `tools/list` with the same bearer token and session header. The automated test performs this complete sequence and verifies that HTTP returns the same 125 tools as stdio.
 
 ## Security and limitations
 
-- Known limitation: `/register` is rate-limited per remote address. Behind `cloudflared` every request arrives from loopback, so all clients share one bucket; a flood of registrations can temporarily block new client setup (existing tokens are unaffected).
+- `/register` allows 20 attempts per client per minute, with a global cap of 200 attempts per minute. Requests rejected by the per-client limit do not consume the global budget. IPv6 clients share a bucket for their /64 prefix, and IPv4-mapped IPv6 addresses use the corresponding IPv4 address. Client buckets are capped at 1,000 entries, evicting expired or oldest entries as needed.
+- When the socket peer is loopback, the limiter uses the first `CF-Connecting-IP` value if it is a valid IP address; otherwise it uses the socket address. Trust this header only when using `cloudflared`, because Cloudflare overwrites it. With other loopback tunnels (ngrok, `ssh -R`, Tailscale Funnel), the header is client-controlled, so only the global cap is meaningful. A distributed attacker can still exhaust the global cap, even with `cloudflared`, temporarily blocking new client setup (existing tokens are unaffected).
 
 The HTTP server defaults to `127.0.0.1`. Keep it on loopback behind an HTTPS tunnel, set `IWORK_MCP_PUBLIC_URL` to the exact external origin, use a strong owner passphrase, and never store secrets in the repository. OAuth state is stored in the current user's data directory with mode `0600`; the passphrase hash is stored separately in the current user's configuration directory.
 
