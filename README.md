@@ -100,6 +100,8 @@ The client discovers the OAuth metadata, registers itself, opens the local conse
 
 For local use, an MCP client communicates with the server over stdio. For remote use, the official SDK's Streamable HTTP transport serves `/mcp` behind OAuth. Tool registration is shared, so both transports expose the same tool set. Tool calls run JavaScript for Automation through the system scripting process and control the installed iWork applications.
 
+Each scripting call is killed if it runs too long. Ordinary calls time out after 30 seconds and saves after 120 seconds. To change these limits for large documents, set `IWORK_MCP_TIMEOUT_MS` and `IWORK_MCP_SAVE_TIMEOUT_MS` (in milliseconds).
+
 ## Development
 
 ```bash

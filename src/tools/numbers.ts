@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioExportPDF, clickMenuItem, resolveAppName } from "../jxa.js";
+import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioExportPDF, saveTimeout, clickMenuItem, resolveAppName } from "../jxa.js";
 import { ANNOTATIONS } from "../annotations.js";
 
 function toolResult(text: string, isError = false) {
@@ -31,6 +31,25 @@ async function handleJXA<T>(fn: () => Promise<T>): Promise<{ content: { type: "t
     }
     return toolResult(String(err), true);
   }
+}
+
+/** Numbers rejects tables smaller than 2x2 ("Invalid row/column count", -10000). */
+export const MIN_TABLE_DIMENSION = 2;
+
+/**
+ * Table size for a block of data: at least 2x2, wide enough for the longest row,
+ * and with at least one body row below the header rows (Numbers rejects
+ * headerRowCount >= rowCount with "Invalid header row count").
+ */
+export function tableDimensions(
+  data: readonly (readonly unknown[])[],
+  headerRowCount?: number | null,
+): { rowCount: number; columnCount: number } {
+  const dataCols = data.reduce((max, row) => Math.max(max, row.length), 0);
+  return {
+    rowCount: Math.max(MIN_TABLE_DIMENSION, data.length, (headerRowCount ?? 0) + 1),
+    columnCount: Math.max(MIN_TABLE_DIMENSION, dataCols),
+  };
 }
 
 export function registerNumbersTools(server: McpServer): void {
@@ -105,8 +124,10 @@ export function registerNumbersTools(server: McpServer): void {
     async ({ documentName, filePath }) => handleJXA(async () => {
       if (isCreatorStudio()) {
         if (filePath) {
-          const newName = await creatorStudioSaveAs("Numbers", documentName, filePath);
-          return JSON.stringify({ saved: true, name: newName });
+          const { name, reopened } = await creatorStudioSaveAs("Numbers", documentName, filePath);
+          return JSON.stringify(reopened
+            ? { saved: true, name }
+            : { saved: true, name, reopened: false, note: `Saved, but Numbers did not reopen the file; open it with numbers_open_document if needed.` });
         }
         return JSON.stringify({ saved: true, name: documentName });
       }
@@ -122,7 +143,7 @@ export function registerNumbersTools(server: McpServer): void {
         doc.save();
       }
       return JSON.stringify({ saved: true, name: doc.name() });
-    `, { documentName, filePath: filePath ?? null });
+    `, { documentName, filePath: filePath ?? null }, { timeout: saveTimeout(), label: "numbers:save" });
     }),
   );
 
@@ -267,8 +288,8 @@ export function registerNumbersTools(server: McpServer): void {
       const doc = app.documents.byName(params.documentName);
       const sheet = params.sheetName ? doc.sheets.byName(params.sheetName) : doc.sheets[0];
       const props = {};
-      if (params.rows) props.rowCount = params.rows;
-      if (params.columns) props.columnCount = params.columns;
+      if (params.rows) props.rowCount = Math.max(${MIN_TABLE_DIMENSION}, params.rows);
+      if (params.columns) props.columnCount = Math.max(${MIN_TABLE_DIMENSION}, params.columns);
       const table = app.Table(props);
       sheet.tables.push(table);
       if (params.tableName) {
@@ -1223,10 +1244,9 @@ export function registerNumbersTools(server: McpServer): void {
         try { app.delete(sheet.tables[0]); } catch(e) {}
       }
 
-      // Create our table with the right dimensions
+      // Create our table (dimensions pre-clamped to the 2x2 minimum in tableDimensions())
       const dataRows = params.data.length;
-      const dataCols = Math.max(...params.data.map(r => r.length));
-      const table = app.Table({ rowCount: dataRows, columnCount: dataCols });
+      const table = app.Table({ rowCount: params.rowCount, columnCount: params.columnCount });
       sheet.tables.push(table);
       table.name = params.tableName || params.sheetName;
 
@@ -1298,14 +1318,15 @@ export function registerNumbersTools(server: McpServer): void {
       return JSON.stringify({
         sheetName: sheet.name(),
         tableName: table.name(),
-        rows: dataRows,
-        columns: dataCols,
+        rows: table.rowCount(),
+        columns: table.columnCount(),
         headerRowCount: table.headerRowCount(),
       });
     `, {
       documentName, sheetName,
       tableName: tableName ?? null,
       data,
+      ...tableDimensions(data, headerRowCount),
       headerRowCount: headerRowCount ?? null,
       columnWidths: columnWidths ?? null,
       rowHeights: rowHeights ?? null,

@@ -1,6 +1,7 @@
+import { existsSync } from "node:fs";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioExportPDF, clickMenuItem, resolveAppName, pagesInsertTableViaUI } from "../jxa.js";
+import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioExportPDF, saveTimeout, clickMenuItem, resolveAppName, pagesInsertTableViaUI } from "../jxa.js";
 import { ANNOTATIONS } from "../annotations.js";
 
 function toolResult(text: string, isError = false) {
@@ -105,8 +106,10 @@ export function registerPagesTools(server: McpServer): void {
     async ({ documentName, filePath }) => handleJXA(async () => {
       if (isCreatorStudio()) {
         if (filePath) {
-          const newName = await creatorStudioSaveAs("Pages", documentName, filePath);
-          return JSON.stringify({ saved: true, name: newName });
+          const { name, reopened } = await creatorStudioSaveAs("Pages", documentName, filePath);
+          return JSON.stringify(reopened
+            ? { saved: true, name }
+            : { saved: true, name, reopened: false, note: `Saved, but Pages did not reopen the file; open it with pages_open_document if needed.` });
         }
         return JSON.stringify({ saved: true, name: documentName });
       }
@@ -122,7 +125,7 @@ export function registerPagesTools(server: McpServer): void {
         doc.save();
       }
       return JSON.stringify({ saved: true, name: doc.name() });
-    `, { documentName, filePath: filePath ?? null });
+    `, { documentName, filePath: filePath ?? null }, { timeout: saveTimeout(), label: "pages:save" });
     }),
   );
 
@@ -473,13 +476,29 @@ export function registerPagesTools(server: McpServer): void {
       filePath: z.string().startsWith("/").describe("Absolute path to the image file"),
     },
     ANNOTATIONS.readWrite,
-    async ({ documentName, filePath }) => handleJXA(() => runJXA<string>(`
-      const app = Application("Pages");
-      const doc = app.documents.byName(params.documentName);
-      const image = app.Image({ file: Path(params.filePath) });
-      doc.images.push(image);
-      return JSON.stringify({ added: true, path: params.filePath });
-    `, { documentName, filePath })),
+    async ({ documentName, filePath }) => handleJXA(async () => {
+      if (!existsSync(filePath)) throw new Error(`Image file not found: ${filePath}`);
+      // Creating an image at document level fails with -2763 "Don't know how to
+      // create TMAScriptImageInfoProxy" (in JXA and AppleScript alike); creating it
+      // on a page works. The file must be a Path — a plain string silently no-ops.
+      return runJXA<string>(`
+        const app = Application("Pages");
+        const doc = app.documents.byName(params.documentName);
+        const before = doc.images.length;
+        const pageIndex = doc.pages.length - 1;
+        let pageErr = null;
+        try {
+          doc.pages[pageIndex].images.push(app.Image({ file: Path(params.filePath) }));
+        } catch (e) { pageErr = e; }
+        if (doc.images.length === before) {
+          try { doc.images.push(app.Image({ file: Path(params.filePath) })); } catch (e) { throw pageErr || e; }
+        }
+        if (doc.images.length === before) throw new Error("Pages did not insert the image");
+        const imgs = doc.images();
+        const img = imgs[imgs.length - 1];
+        return JSON.stringify({ added: true, path: params.filePath, page: pageIndex + 1, width: img.width(), height: img.height() });
+      `, { documentName, filePath });
+    }),
   );
 
   server.tool(
