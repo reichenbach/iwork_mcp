@@ -506,18 +506,53 @@ function createdKey(appName: IWorkApp, name: string): string {
   return `${appName}:${name.endsWith(ext) ? name.slice(0, -ext.length) : name}`;
 }
 
-/** The iCloud auto-save of a document a tool created, or null. */
-export async function untitledAutoSavePath(appName: IWorkApp, documentName: string): Promise<string | null> {
-  if (!createdDocuments.has(createdKey(appName, documentName))) return null;
-  const path = await runJXA<string | null>(
+/** The file of an open document, or null if it has none (or the lookup fails). */
+async function documentFile(appName: IWorkApp, documentName: string): Promise<string | null> {
+  return runJXA<string | null>(
     `
     const f = Application("${resolveAppName(appName)}").documents.byName(params.documentName).file();
     return JSON.stringify(f ? f.toString() : null);
     `,
     { documentName },
-    { label: "untitledAutoSavePath" },
+    { label: "documentFile" },
   ).catch(() => null);
-  return path && path.includes("/Library/Mobile Documents/") ? path : null;
+}
+
+/**
+ * The iCloud auto-save of an untitled document, or null: a draft (new or imported,
+ * never saved — also one created before a server restart), or a document a tool created.
+ */
+export async function untitledAutoSavePath(appName: IWorkApp, documentName: string): Promise<string | null> {
+  const path = await documentFile(appName, documentName);
+  if (!path || !path.includes("/Library/Mobile Documents/")) return null;
+  return createdDocuments.has(createdKey(appName, documentName)) || await isDraftFile(path) ? path : null;
+}
+
+/**
+ * Close a document. A draft can't be saved in place (a Save sheet would open and block),
+ * so saving "yes" on one is an error; saving "no" also moves its iCloud draft to the
+ * Trash, which Creator Studio would otherwise keep (closing it in the app deletes it).
+ */
+export async function closeDocument(appName: IWorkApp, documentName: string, saving?: "yes" | "no" | "ask"): Promise<string> {
+  if (saving === "yes") {
+    const file = await documentFile(appName, documentName);
+    if (file && await isDraftFile(file)) {
+      throw new Error('The document has never been saved (it is new or was imported from another format); save it with a filePath first, or close it with saving "no"');
+    }
+  }
+  const autoSave = saving === "no" ? await untitledAutoSavePath(appName, documentName) : null;
+  const result = await runJXA<string>(
+    `
+    const doc = Application("${resolveAppName(appName)}").documents.byName(params.documentName);
+    if (params.saving) doc.close({ saving: params.saving });
+    else doc.close();
+    return JSON.stringify(params.trashDraft ? { closed: true, draftTrashed: true } : { closed: true });
+    `,
+    { documentName, saving: saving ?? null, trashDraft: Boolean(autoSave) },
+    { label: "closeDocument" },
+  );
+  if (autoSave) await trashUntitledAutoSave(appName, documentName, autoSave);
+  return result;
 }
 
 /** Move a tool-created document's untitled auto-save to the Trash once no open document uses it. */

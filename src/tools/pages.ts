@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioPagesExportPDF, saveTimeout, clickMenuItem, resolveAppName, pagesInsertTableViaUI, isDraftFile, selectForMenu } from "../jxa.js";
+import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioPagesExportPDF, saveTimeout, clickMenuItem, resolveAppName, pagesInsertTableViaUI, isDraftFile, selectForMenu, closeDocument } from "../jxa.js";
 import { ANNOTATIONS } from "../annotations.js";
 
 function toolResult(text: string, isError = false) {
@@ -270,23 +270,13 @@ export function registerPagesTools(server: McpServer): void {
 
   server.tool(
     "pages_close_document",
-    "Close a Pages document",
+    "Close a Pages document. With saving \"no\", a document that was never saved (new, or imported from another format) is discarded, including its iCloud draft (moved to the Trash). Such a document can't be closed with saving \"yes\": save it with a file path first.",
     {
       documentName: z.string().describe("Name of the open document"),
       saving: z.enum(["yes", "no", "ask"]).optional().describe("Whether to save before closing"),
     },
     ANNOTATIONS.destructive,
-    async ({ documentName, saving }) => handleJXA(() => runJXA<string>(`
-      const app = Application("Pages");
-      const doc = app.documents.byName(params.documentName);
-      const saveOpts = { yes: "yes", no: "no", ask: "ask" };
-      if (params.saving) {
-        doc.close({ saving: saveOpts[params.saving] });
-      } else {
-        doc.close();
-      }
-      return JSON.stringify({ closed: true });
-    `, { documentName, saving: saving ?? null })),
+    async ({ documentName, saving }) => handleJXA(() => closeDocument("Pages", documentName, saving)),
   );
 
   // ── Text Reading Tools ──

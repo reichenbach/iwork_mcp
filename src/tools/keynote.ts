@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioKeynoteExportPDF, rememberCreatedDocument, untitledAutoSavePath, trashUntitledAutoSave, saveTimeout, clickMenuItem, resolveAppName, selectForMenu } from "../jxa.js";
+import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioKeynoteExportPDF, rememberCreatedDocument, saveTimeout, clickMenuItem, resolveAppName, selectForMenu, closeDocument } from "../jxa.js";
 import { ANNOTATIONS } from "../annotations.js";
 
 const execFileAsync = promisify(execFile);
@@ -409,29 +409,13 @@ export function registerKeynoteTools(server: McpServer): void {
 
   server.tool(
     "keynote_close_presentation",
-    "Close a Keynote presentation",
+    "Close a Keynote presentation. With saving \"no\", a presentation that was never saved (new, or imported from another format) is discarded, including its iCloud draft (moved to the Trash). Such a presentation can't be closed with saving \"yes\": save it with a file path first.",
     {
       documentName: z.string().describe("Name of the open presentation"),
       saving: z.enum(["yes", "no", "ask"]).optional().describe("Whether to save before closing"),
     },
     ANNOTATIONS.destructive,
-    async ({ documentName, saving }) => handleJXA(async () => {
-      // Creator Studio keeps the iCloud auto-save of an untitled document even when closed without saving
-      const autoSave = isCreatorStudio() && saving === "no" ? await untitledAutoSavePath("Keynote", documentName) : null;
-      const result = await runJXA<string>(`
-      const app = Application("Keynote");
-      const doc = app.documents.byName(params.documentName);
-      const saveOpts = { yes: "yes", no: "no", ask: "ask" };
-      if (params.saving) {
-        doc.close({ saving: saveOpts[params.saving] });
-      } else {
-        doc.close();
-      }
-      return JSON.stringify({ closed: true });
-    `, { documentName, saving: saving ?? null });
-      if (autoSave) await trashUntitledAutoSave("Keynote", documentName, autoSave);
-      return result;
-    }),
+    async ({ documentName, saving }) => handleJXA(() => closeDocument("Keynote", documentName, saving)),
   );
 
   // ── Slide Tools ──
