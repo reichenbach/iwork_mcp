@@ -321,7 +321,7 @@ export function registerPagesTools(server: McpServer): void {
       const result = [];
       for (let i = 0; i < count; i++) {
         const p = paras[i];
-        const text = p();
+        const text = p().replace(/\\n$/, "");
         if (text === "" && i === count - 1) continue;  // skip trailing empty paragraph
         const entry = { index: i, text: text };
         try { entry.font = p.font(); } catch(e) {}
@@ -365,7 +365,7 @@ export function registerPagesTools(server: McpServer): void {
 
   server.tool(
     "pages_list_images",
-    "List all images in a Pages document with their positions and sizes",
+    "List all images in a Pages document with their positions and sizes (index is 0-based)",
     {
       documentName: z.string().describe("Name of the open document"),
     },
@@ -515,12 +515,16 @@ export function registerPagesTools(server: McpServer): void {
         fontSize: z.number().positive().optional().describe("Font size in points"),
         fontName: z.string().optional().describe("PostScript font name (e.g. 'HelveticaNeue-Bold' for bold, 'Georgia-Italic' for italic)"),
         textColor: z.string().regex(/^#[0-9A-Fa-f]{6}$/).optional().describe("Text color as hex, e.g. '#FF0000'"),
-      }).describe("Formatting options"),
+      }).refine((f) => Object.values(f).some((v) => v !== undefined), "Set at least one of fontSize, fontName or textColor").describe("Formatting options"),
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, paragraphIndex, format }) => handleJXA(() => runJXA<string>(`
       const app = Application("Pages");
       const doc = app.documents.byName(params.documentName);
+      const paraCount = doc.bodyText.paragraphs.length;
+      if (params.paragraphIndex >= paraCount) {
+        throw new Error("Paragraph index " + params.paragraphIndex + " out of range (0-" + (paraCount - 1) + ")");
+      }
       const paragraph = doc.bodyText.paragraphs[params.paragraphIndex];
       const fmt = params.format;
 
@@ -922,7 +926,7 @@ export function registerPagesTools(server: McpServer): void {
     "Upscale an image in a document using AI Super Resolution (Creator Studio only). Increases resolution while preserving quality.",
     {
       documentName: z.string().describe("Name of the open document"),
-      imageIndex: z.number().int().min(1).describe("Image index (1-based) in the document"),
+      imageIndex: z.number().int().min(1).describe("Image index, 1-based (pages_list_images index + 1)"),
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, imageIndex }) => {
@@ -952,7 +956,7 @@ export function registerPagesTools(server: McpServer): void {
     "Remove the background from an image in a document using AI (Creator Studio only).",
     {
       documentName: z.string().describe("Name of the open document"),
-      imageIndex: z.number().int().min(1).describe("Image index (1-based) in the document"),
+      imageIndex: z.number().int().min(1).describe("Image index, 1-based (pages_list_images index + 1)"),
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, imageIndex }) => {
