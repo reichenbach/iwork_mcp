@@ -827,8 +827,8 @@ export function registerPagesTools(server: McpServer): void {
     "Create a Pages document with multiple formatted paragraphs in one call (much faster than adding paragraphs individually). For bold/italic, use PostScript font names like 'HelveticaNeue-Bold' or 'Georgia-Italic'.",
     {
       paragraphs: z.array(z.object({
-        text: z.string().describe("Paragraph text (no trailing newline needed)"),
-        fontSize: z.number().positive().optional().describe("Font size in points (default: 12)"),
+        text: z.string().describe("Paragraph text (no trailing newline needed; a newline inside it starts another paragraph with the same formatting)"),
+        fontSize: z.number().positive().optional().describe("Font size in points (default: the template's body size)"),
         fontName: z.string().optional().describe("PostScript font name, e.g. 'HelveticaNeue-Bold', 'Georgia-Italic'"),
         textColor: z.string().regex(/^#[0-9A-Fa-f]{6}$/).optional().describe("Text color as hex, e.g. '#FF0000'"),
       })).describe("Array of paragraphs with optional formatting"),
@@ -836,38 +836,57 @@ export function registerPagesTools(server: McpServer): void {
     },
     ANNOTATIONS.readWrite,
     async ({ paragraphs, filePath }) => handleJXA(() => runJXA<string>(`
+      ObjC.import("AppKit");
+      // A wrong font name fails halfway with an opaque -1700; check them before creating anything
+      const badFonts = [];
+      for (const p of params.paragraphs) {
+        if (p.fontName && $.NSFont.fontWithNameSize(p.fontName, 12).isNil() && badFonts.indexOf(p.fontName) < 0) badFonts.push(p.fontName);
+      }
+      if (badFonts.length) throw new Error("Unknown font name(s): " + badFonts.join(", ") + ". Use PostScript names like 'HelveticaNeue-Bold'.");
+
       const app = Application("Pages");
       let doc = app.Document();
       app.documents.push(doc);
-
-      // Build full text with newlines between paragraphs
-      let fullText = "";
-      for (let i = 0; i < params.paragraphs.length; i++) {
-        fullText += params.paragraphs[i].text + "\\n";
-      }
-      doc.bodyText = fullText;
-
-      // Format each paragraph via bodyText.paragraphs
-      // A single input paragraph with \\n creates multiple Pages paragraphs,
-      // so we track the real index offset and apply formatting to all sub-paragraphs.
-      let paraIdx = 0;
-      for (let i = 0; i < params.paragraphs.length; i++) {
-        const p = params.paragraphs[i];
-        const nlCount = (p.text.match(/\\n/g) || []).length;
-        let r, g, b;
-        if (p.textColor !== undefined) {
-          const hex = p.textColor;
-          r = parseInt(hex.slice(1, 3), 16) * 257;
-          g = parseInt(hex.slice(3, 5), 16) * 257;
-          b = parseInt(hex.slice(5, 7), 16) * 257;
+      try {
+        // Build full text with newlines between paragraphs
+        let fullText = "";
+        for (let i = 0; i < params.paragraphs.length; i++) {
+          fullText += params.paragraphs[i].text + "\\n";
         }
-        for (let j = 0; j <= nlCount; j++) {
-          const para = doc.bodyText.paragraphs[paraIdx + j];
-          if (p.fontSize !== undefined) para.size = p.fontSize;
-          if (p.fontName !== undefined) para.font = p.fontName;
-          if (r !== undefined) para.color = [r, g, b];
+        doc.bodyText = fullText;
+
+        // Format each paragraph via bodyText.paragraphs
+        // A single input paragraph with \\n creates multiple Pages paragraphs,
+        // so we track the real index offset and apply formatting to all sub-paragraphs.
+        let paraIdx = 0;
+        for (let i = 0; i < params.paragraphs.length; i++) {
+          const p = params.paragraphs[i];
+          const nlCount = (p.text.match(/\\n/g) || []).length;
+          let r, g, b;
+          if (p.textColor !== undefined) {
+            const hex = p.textColor;
+            r = parseInt(hex.slice(1, 3), 16) * 257;
+            g = parseInt(hex.slice(3, 5), 16) * 257;
+            b = parseInt(hex.slice(5, 7), 16) * 257;
+          }
+          for (let j = 0; j <= nlCount; j++) {
+            const para = doc.bodyText.paragraphs[paraIdx + j];
+            if (p.fontSize !== undefined) para.size = p.fontSize;
+            if (p.fontName !== undefined) para.font = p.fontName;
+            if (r !== undefined) para.color = [r, g, b];
+          }
+          paraIdx += nlCount + 1;
         }
-        paraIdx += nlCount + 1;
+      } catch (e) {
+        // Don't leave a half-filled untitled document (or its iCloud auto-save) behind
+        let autoSave = null;
+        try { autoSave = doc.file() ? doc.file().toString() : null; } catch (e2) {}
+        try { doc.close({ saving: "no" }); } catch (e2) {}
+        if (autoSave && autoSave.indexOf("/Library/Mobile Documents/") >= 0) {
+          delay(1);
+          $.NSFileManager.defaultManager.trashItemAtURLResultingItemURLError($.NSURL.fileURLWithPath(autoSave), null, null);
+        }
+        throw e;
       }
 
       if (params.filePath) {
