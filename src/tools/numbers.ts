@@ -1778,14 +1778,17 @@ export function registerNumbersTools(server: McpServer): void {
         { label: "magic_fill:enter_table" });
 
         // 3. Click "Magic Fill Cells" (or "Magic Fill Cell" for single cell)
-        try {
-          await clickMenuItem("Numbers", ["Table", "Magic Fill Cells"]);
-        } catch {
+        // The title depends on the version and the selection ("Magic Fill" in 15.4)
+        let filled = false;
+        for (const title of ["Magic Fill Cells", "Magic Fill Cell", "Magic Fill"]) {
           try {
-            await clickMenuItem("Numbers", ["Table", "Magic Fill Cell"]);
-          } catch {
-            throw new Error("Magic Fill is not available. Ensure the selected range is adjacent to rows with example values that show a recognizable pattern.");
-          }
+            await clickMenuItem("Numbers", ["Table", title]);
+            filled = true;
+            break;
+          } catch {}
+        }
+        if (!filled) {
+          throw new Error("Magic Fill is not available. Ensure the selected range is adjacent to rows with example values that show a recognizable pattern.");
         }
 
         // 4. Wait for AI to process suggestions and accept with Return
