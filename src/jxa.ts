@@ -609,6 +609,17 @@ export function injectDocumentNameResolution(script: string): string {
 
   const injection = `
   // [iwork-mcp] Creator Studio document name resolution
+  {
+    // Untitled documents are renamed on auto-save ("X" -> "X${ext}"), so a new
+    // "X" can coexist with it; refuse to guess which one is meant
+    let __names = [];
+    try { __names = ${appExpr}.documents.name(); } catch(__e) {}
+    const __matches = __names.filter(function (n) { return n === params.documentName || n === params.documentName + ${JSON.stringify(ext)}; });
+    if (__matches.length > 1) {
+      throw new Error("Several open documents match the name " + JSON.stringify(params.documentName) + " (" + __matches.join(", ") +
+        "). Save or close one of them first so each has its own name.");
+    }
+  }
   try {
     const __app = ${appExpr};
     __app.documents.byName(params.documentName).name();
