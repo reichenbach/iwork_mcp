@@ -463,35 +463,44 @@ export function registerPagesTools(server: McpServer): void {
 
   server.tool(
     "pages_replace_text",
-    "Find and replace text in a Pages document (preserves formatting)",
+    "Find and replace text in a Pages document. The replacement takes the formatting of the first character it replaces; the rest of the paragraph, other text, inline images and tables are left as they are.",
     {
       documentName: z.string().describe("Name of the open document"),
-      find: z.string().describe("Text to find"),
+      find: z.string().min(1).describe("Text to find"),
       replace: z.string().describe("Replacement text"),
       all: z.boolean().optional().describe("Replace all occurrences (default: true)"),
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, find, replace, all }) => handleJXA(() => runJXA<string>(`
-      const app = Application("Pages");
-      const doc = app.documents.byName(params.documentName);
-      const paras = doc.bodyText.paragraphs;
-      const count = paras.length;
-      let total = 0;
-      for (let i = 0; i < count; i++) {
-        const text = paras[i]();
-        if (text.indexOf(params.find) === -1) continue;
-        if (params.all !== false) {
-          const parts = text.split(params.find);
-          total += parts.length - 1;
-          doc.bodyText.paragraphs[i] = parts.join(params.replace);
-        } else if (total === 0) {
-          const idx = text.indexOf(params.find);
-          doc.bodyText.paragraphs[i] = text.substring(0, idx) + params.replace + text.substring(idx + params.find.length);
-          total = 1;
-          break;
+      ${BODY_EDIT_HELPERS}
+      const doc = openDoc(params.documentName);
+      const text = bodyChars(doc).join("");
+      const findLength = Array.from(params.find).length;
+      const replaceLength = Array.from(params.replace).length;
+      // Character positions of the matches (code points, like doc.bodyText.characters)
+      const hits = [];
+      let from = 0, pos = 0, idx;
+      while ((idx = text.indexOf(params.find, from)) !== -1) {
+        pos += Array.from(text.slice(from, idx)).length;
+        hits.push(pos);
+        pos += findLength;
+        from = idx + params.find.length;
+        if (params.all === false) break;
+      }
+      // From the last match back, so the positions before it stay valid
+      for (let h = hits.length - 1; h >= 0; h--) {
+        const k = hits[h];
+        if (!replaceLength) {
+          deleteChars(doc, k, k + findLength - 1);
+        } else {
+          setChar(doc, k, params.replace);
+          // Make sure Pages took the first change before deleting the rest of the match
+          if (h === hits.length - 1) checkBody(doc);
+          deleteChars(doc, k + replaceLength, k + replaceLength + findLength - 2);
         }
       }
-      return JSON.stringify({ replacements: total });
+      if (hits.length) checkBody(doc);
+      return JSON.stringify({ replacements: hits.length });
     `, { documentName, find, replace, all: all ?? true })),
   );
 
