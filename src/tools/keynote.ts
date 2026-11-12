@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioKeynoteExportPDF, rememberCreatedDocument, untitledAutoSavePath, trashUntitledAutoSave, saveTimeout, clickMenuItem, resolveAppName } from "../jxa.js";
+import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioKeynoteExportPDF, rememberCreatedDocument, saveTimeout, clickMenuItem, resolveAppName, selectForMenu, closeDocument } from "../jxa.js";
 import { ANNOTATIONS } from "../annotations.js";
 
 const execFileAsync = promisify(execFile);
@@ -409,29 +409,13 @@ export function registerKeynoteTools(server: McpServer): void {
 
   server.tool(
     "keynote_close_presentation",
-    "Close a Keynote presentation",
+    "Close a Keynote presentation. With saving \"no\", a presentation that was never saved (new, or imported from another format) is discarded, including its iCloud draft (moved to the Trash). Such a presentation can't be closed with saving \"yes\": save it with a file path first.",
     {
       documentName: z.string().describe("Name of the open presentation"),
       saving: z.enum(["yes", "no", "ask"]).optional().describe("Whether to save before closing"),
     },
     ANNOTATIONS.destructive,
-    async ({ documentName, saving }) => handleJXA(async () => {
-      // Creator Studio keeps the iCloud auto-save of an untitled document even when closed without saving
-      const autoSave = isCreatorStudio() && saving === "no" ? await untitledAutoSavePath("Keynote", documentName) : null;
-      const result = await runJXA<string>(`
-      const app = Application("Keynote");
-      const doc = app.documents.byName(params.documentName);
-      const saveOpts = { yes: "yes", no: "no", ask: "ask" };
-      if (params.saving) {
-        doc.close({ saving: saveOpts[params.saving] });
-      } else {
-        doc.close();
-      }
-      return JSON.stringify({ closed: true });
-    `, { documentName, saving: saving ?? null });
-      if (autoSave) await trashUntitledAutoSave("Keynote", documentName, autoSave);
-      return result;
-    }),
+    async ({ documentName, saving }) => handleJXA(() => closeDocument("Keynote", documentName, saving)),
   );
 
   // ── Slide Tools ──
@@ -2003,17 +1987,15 @@ export function registerKeynoteTools(server: McpServer): void {
         return toolResult("Super Resolution requires Apple Creator Studio (iWork 15.1+).", true);
       }
       return handleJXA(async () => {
-        await runJXA<void>(`
-          const app = Application("Keynote");
-          app.activate();
-          const doc = app.documents.byName(params.documentName);
-          doc.currentSlide = doc.slides[params.slideIndex - 1];
-          const slide = doc.slides[params.slideIndex - 1];
-          const images = slide.images();
+        const docName = await runJXA<string>(`
+          const doc = Application("Keynote").documents.byName(params.documentName);
+          if (params.slideIndex > doc.slides.length) throw new Error("Slide " + params.slideIndex + " out of range (presentation has " + doc.slides.length + " slides)");
+          const images = doc.slides[params.slideIndex - 1].images();
           if (params.imageIndex > images.length) throw new Error("Image index " + params.imageIndex + " out of range (slide has " + images.length + " images)");
-          app.selection = [images[params.imageIndex - 1]];
+          return JSON.stringify(doc.name());
         `, { documentName, slideIndex, imageIndex },
-        { label: "super_resolution:select" });
+        { label: "super_resolution:check" });
+        await selectForMenu("Keynote", docName, "image " + imageIndex + " of slide " + slideIndex, "set current slide of d to slide " + slideIndex + " of d");
 
         await clickMenuItem("Keynote", ["Format", "Image", "Super Resolution"], { postdelay: 2 });
 
@@ -2036,17 +2018,15 @@ export function registerKeynoteTools(server: McpServer): void {
         return toolResult("Remove Background requires Apple Creator Studio (iWork 15.1+).", true);
       }
       return handleJXA(async () => {
-        await runJXA<void>(`
-          const app = Application("Keynote");
-          app.activate();
-          const doc = app.documents.byName(params.documentName);
-          doc.currentSlide = doc.slides[params.slideIndex - 1];
-          const slide = doc.slides[params.slideIndex - 1];
-          const images = slide.images();
+        const docName = await runJXA<string>(`
+          const doc = Application("Keynote").documents.byName(params.documentName);
+          if (params.slideIndex > doc.slides.length) throw new Error("Slide " + params.slideIndex + " out of range (presentation has " + doc.slides.length + " slides)");
+          const images = doc.slides[params.slideIndex - 1].images();
           if (params.imageIndex > images.length) throw new Error("Image index " + params.imageIndex + " out of range (slide has " + images.length + " images)");
-          app.selection = [images[params.imageIndex - 1]];
+          return JSON.stringify(doc.name());
         `, { documentName, slideIndex, imageIndex },
-        { label: "remove_background:select" });
+        { label: "remove_background:check" });
+        await selectForMenu("Keynote", docName, "image " + imageIndex + " of slide " + slideIndex, "set current slide of d to slide " + slideIndex + " of d");
 
         await clickMenuItem("Keynote", ["Format", "Image", "Remove Background"], { postdelay: 2 });
 

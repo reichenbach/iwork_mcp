@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm, copyFile, stat } from "node:fs/promises";
+import { mkdtemp, rm, copyFile, stat, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -59,44 +59,274 @@ export function processName(app: IWorkApp): string {
   return app; // System Events always uses the base name ("Keynote", not "Keynote Creator Studio")
 }
 
+// ── Menus in the app's UI language ──
+// Tools name menu items by their English titles. When the app runs in another language,
+// the titles are translated with the app's own MainMenu.strings: en_GB/en_AU hold the
+// English titles under the same keys as every other localization (Base is a compiled nib).
+
+type MenuStrings = Record<string, string>;
+const menuStringsCache = new Map<string, Promise<MenuStrings | null>>();
+const resolvedMenuPaths = new Map<string, string[]>();
+const US = "\u001f"; // separates titles in osascript arguments and results
+
+function readMenuStrings(file: string): Promise<MenuStrings | null> {
+  let p = menuStringsCache.get(file);
+  if (!p) {
+    p = execFileAsync("/usr/bin/plutil", ["-convert", "json", "-o", "-", file], { timeout: 10_000, maxBuffer: 8 * 1024 * 1024 })
+      .then(({ stdout }) => JSON.parse(stdout) as MenuStrings)
+      .catch(() => null);
+    menuStringsCache.set(file, p);
+  }
+  return p;
+}
+
+const normalizeTitle = (t: string) => t.replace(/(…|\.\.\.)$/, "").trim().toLowerCase();
+
+/** For each English title, the title itself plus its translations in the UI language (best match for the menu bar). */
+export async function menuTitleCandidates(app: IWorkApp, englishPath: string[], menuBarTitles: string[]): Promise<string[][]> {
+  const res = `/Applications/${resolveAppName(app)}.app/Contents/Resources`;
+  let english: MenuStrings | null = null;
+  for (const l of ["en_GB", "en_AU", "en"]) {
+    english = await readMenuStrings(`${res}/${l}.lproj/MainMenu.strings`);
+    if (english) break;
+  }
+  let local: MenuStrings | null = null;
+  if (english) {
+    const dirs = (await readdir(res).catch(() => [] as string[])).filter((d) => d.endsWith(".lproj"));
+    const tables = await Promise.all(dirs.map((d) => readMenuStrings(`${res}/${d}/MainMenu.strings`)));
+    let bestScore = 0;
+    for (const t of tables) {
+      if (!t) continue;
+      const titles = new Set(Object.values(t));
+      const score = menuBarTitles.filter((b) => titles.has(b)).length;
+      if (score > bestScore) { bestScore = score; local = t; }
+    }
+  }
+  return englishPath.map((name) => {
+    const out = [name];
+    if (english && local) {
+      for (const [key, value] of Object.entries(english)) {
+        const translated = local[key];
+        if (translated && normalizeTitle(value) === normalizeTitle(name) && !out.includes(translated)) out.push(translated);
+      }
+    }
+    return out;
+  });
+}
+
+/** Find the first existing menu path among per-level candidate titles. */
+async function findMenuPath(app: IWorkApp, candidates: string[][]): Promise<{ path: string[] | null; menuBarTitles: string[] }> {
+  const script = `
+on splitText(t)
+  set AppleScript's text item delimiters to (character id 31)
+  set r to text items of t
+  set AppleScript's text item delimiters to ""
+  return r
+end splitText
+on run argv
+  set us to character id 31
+  tell application "System Events" to tell process "${processName(app)}"
+    repeat with a in my splitText(item 1 of argv)
+      set a to a as text
+      if exists menu a of menu bar 1 then
+        if (count of argv) is 1 then return a
+        repeat with b in my splitText(item 2 of argv)
+          set b to b as text
+          if exists menu item b of menu a of menu bar 1 then
+            if (count of argv) is 2 then return a & us & b
+            repeat with c in my splitText(item 3 of argv)
+              set c to c as text
+              if exists menu item c of menu b of menu item b of menu a of menu bar 1 then return a & us & b & us & c
+            end repeat
+          end if
+        end repeat
+      end if
+    end repeat
+    set AppleScript's text item delimiters to us
+    set bar to (name of every menu bar item of menu bar 1) as text
+    set AppleScript's text item delimiters to ""
+    return (character id 30) & bar
+  end tell
+end run
+`;
+  let out: string;
+  try {
+    ({ stdout: out } = await execFileAsync("/usr/bin/osascript", ["-e", script, ...candidates.map((c) => c.join(US))], { timeout: 15_000 }));
+  } catch (err) {
+    const e = err as { stderr?: string; message?: string; code?: number };
+    throw new OsascriptError(e.stderr || e.message || String(err), typeof e.code === "number" ? e.code : null);
+  }
+  out = out.replace(/\n$/, "");
+  if (out.startsWith("\u001e")) return { path: null, menuBarTitles: out.slice(1).split(US) };
+  return { path: out.split(US), menuBarTitles: [] };
+}
+
+/** Resolve an English menu path to the titles the app shows (cached). */
+export async function resolveMenuPath(app: IWorkApp, menuPath: string[]): Promise<string[]> {
+  if (menuPath.length < 1 || menuPath.length > 3) throw new Error("Menu paths have 1 to 3 levels");
+  const key = [app, ...menuPath].join(US);
+  const cached = resolvedMenuPaths.get(key);
+  if (cached) return cached;
+  let found = await findMenuPath(app, menuPath.map((t) => [t]));
+  if (!found.path) {
+    const candidates = await menuTitleCandidates(app, menuPath, found.menuBarTitles);
+    if (candidates.some((c) => c.length > 1)) found = await findMenuPath(app, candidates);
+  }
+  if (!found.path) {
+    throw new Error(`Menu item ${menuPath.join(" > ")} not found in ${resolveAppName(app)}, neither by its English title nor in the app's UI language.`);
+  }
+  resolvedMenuPaths.set(key, found.path);
+  return found.path;
+}
+
+/** Forget cached menu titles (e.g. after the app was restarted in another language). */
+export function forgetMenuPath(app: IWorkApp, menuPath: string[]): void {
+  resolvedMenuPaths.delete([app, ...menuPath].join(US));
+}
+
+/** AppleScript reference to a menu item from resolved titles. */
+export function menuItemRef(path: string[]): string {
+  const q = (t: string) => `"${t.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  if (path.length === 2) return `menu item ${q(path[1])} of menu ${q(path[0])} of menu bar 1`;
+  if (path.length === 3) return `menu item ${q(path[2])} of menu ${q(path[1])} of ${menuItemRef(path.slice(0, 2))}`;
+  throw new Error("Menu items have 2 or 3 levels");
+}
+
 /**
- * Click a menu item by name via System Events (resolution-independent).
+ * Click a menu item by its English titles via System Events, in any UI language.
  * menuPath is top-level menu followed by nested item names,
  * e.g. ["Table", "Magic Fill Cells"] or ["Format", "Image", "Super Resolution"].
+ * Submenu items are clicked in two steps (open the parent, then the item): a direct
+ * click on a third-level item silently does nothing. A disabled item is an error,
+ * checked before any menu opens. If the click opens a sheet in the front window (for
+ * example a subscription prompt), the sheet is cancelled and its text becomes the error.
  */
 export async function clickMenuItem(
   app: IWorkApp,
   menuPath: string[],
   options?: { predelay?: number; postdelay?: number },
 ): Promise<void> {
-  const proc = processName(app);
+  if (menuPath.length < 2 || menuPath.length > 3) throw new Error("clickMenuItem supports 2 or 3 level menu paths");
   const predelay = options?.predelay ?? 0.3;
   const postdelay = options?.postdelay ?? 0.5;
 
-  // Build the AppleScript menu traversal
-  // ["Format", "Image", "Super Resolution"] →
-  //   menu item "Super Resolution" of menu "Image" of menu item "Image" of menu "Format" of menu bar 1
-  let selector: string;
-  if (menuPath.length === 2) {
-    selector = `menu item "${menuPath[1]}" of menu "${menuPath[0]}" of menu bar 1`;
-  } else if (menuPath.length === 3) {
-    selector = `menu item "${menuPath[2]}" of menu "${menuPath[1]}" of menu item "${menuPath[1]}" of menu "${menuPath[0]}" of menu bar 1`;
-  } else {
-    throw new Error("clickMenuItem supports 2 or 3 level menu paths");
-  }
-
-  const script = `
+  for (let attempt = 0; ; attempt++) {
+    const path = await resolveMenuPath(app, menuPath);
+    const leaf = menuItemRef(path);
+    // A sheet that opens instead (e.g. "Subscribe to Apple Creator Studio" for the AI image
+    // tools) blocks every later call: cancel it and report its text.
+    const script = `
     tell application "${resolveAppName(app)}" to activate
     delay ${predelay}
     tell application "System Events"
-      tell process "${proc}"
-        click ${selector}
+      tell process "${processName(app)}"
+        if not (enabled of ${leaf}) then error "DISABLED"
+        set w to missing value
+        set sheetsBefore to 0
+        try
+          set w to window 1
+          set sheetsBefore to count of sheets of w
+        end try
+        ${path.length === 3 ? `click ${menuItemRef(path.slice(0, 2))}
+        delay 0.4` : ""}
+        click ${leaf}
       end tell
     end tell
-    delay ${postdelay}
+    repeat ${Math.max(1, Math.round(postdelay / 0.25))} times
+      delay 0.25
+      if w is not missing value then
+        tell application "System Events"
+          if (count of sheets of w) > sheetsBefore then
+            delay 0.3
+            set s to sheet 1 of w
+            set msg to ""
+            try
+              set AppleScript's text item delimiters to " "
+              set msg to (value of every static text of s) as text
+              set AppleScript's text item delimiters to ""
+            end try
+            try
+              click (value of attribute "AXCancelButton" of s)
+            end try
+            return "SHEET" & (character id 30) & msg
+          end if
+        end tell
+      end if
+    end repeat
+    return ""
   `;
+    let stdout: string;
+    try {
+      ({ stdout } = await execFileAsync("/usr/bin/osascript", ["-e", script], { timeout: 15_000 + postdelay * 1000 }));
+    } catch (err) {
+      const e = err as { stderr?: string; message?: string; code?: number };
+      const stderr = e.stderr || e.message || String(err);
+      if (stderr.includes("DISABLED")) {
+        throw new Error(`Menu item ${menuPath.join(" > ")} (${path.join(" > ")}) is disabled for the current selection.`);
+      }
+      if (attempt === 0 && /\(-1728\)\s*$/.test(stderr.trim())) {
+        forgetMenuPath(app, menuPath); // titles changed since they were cached
+        continue;
+      }
+      throw new OsascriptError(stderr, typeof e.code === "number" ? e.code : null);
+    }
+    if (stdout.startsWith("SHEET\u001e")) {
+      const text = stdout.slice(6).trim();
+      throw new Error(`${resolveAppName(app)} answered ${menuPath.join(" > ")} with a dialog instead of doing it${text ? `: "${text}"` : ""}. The dialog was cancelled.`);
+    }
+    return;
+  }
+}
 
-  await execFileAsync("/usr/bin/osascript", ["-e", script], { timeout: 15_000 });
+/** AppleScript string literal. */
+export function asString(t: string): string {
+  return `"${t.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+/**
+ * Select one item of a document and bring its window to the front, so that a menu
+ * command applies to it. JXA can't set the selection on 15.x (`app.selection = [...]`
+ * fails with -1728, `doc.selection = [...]` with -1700), but AppleScript
+ * `set selection of document ... to {...}` works in all three apps. Menus act on the
+ * front window, so it is raised first. (Reading the selection back fails in Numbers.)
+ * `itemRef` is relative to the document, e.g. `image 2` or `image 1 of slide 3`;
+ * `prepare` runs first with the document as `d` (e.g. to show the item's slide).
+ */
+export async function selectForMenu(app: IWorkApp, documentName: string, itemRef: string, prepare = ""): Promise<void> {
+  const script = `
+on run argv
+  set docName to item 1 of argv
+  tell application "${resolveAppName(app)}"
+    activate
+    set d to missing value
+    repeat with nm in {docName, docName & "${EXT_MAP[app]}"}
+      if exists document (nm as text) then
+        set d to document (nm as text)
+        exit repeat
+      end if
+    end repeat
+    if d is missing value then error "Document not found: " & docName
+    set docId to id of d
+    repeat with w in windows
+      try
+        if id of document of w is docId then
+          set index of w to 1
+          exit repeat
+        end if
+      end try
+    end repeat
+    ${prepare}
+    delay 0.3
+    set selection of d to {${itemRef} of d}
+  end tell
+end run
+`;
+  try {
+    await execFileAsync("/usr/bin/osascript", ["-e", script, documentName], { timeout: 15_000 });
+  } catch (err) {
+    const e = err as { stderr?: string; message?: string; code?: number };
+    throw new OsascriptError(e.stderr || e.message || String(err), typeof e.code === "number" ? e.code : null);
+  }
 }
 
 /**
@@ -128,11 +358,17 @@ export async function pagesInsertTableViaUI(
     { label: "pagesInsertTableViaUI:resolveName" },
   );
 
+  // Insert > Table > Basic, in the app's UI language
+  const [insertMenu, tableItem, basicItem] = await resolveMenuPath("Pages", ["Insert", "Table", "Basic"]);
+
   const script = `
 on run argv
   set docName to item 1 of argv
   set newRows to (item 2 of argv) as integer
   set newCols to (item 3 of argv) as integer
+  set insertMenu to item 4 of argv
+  set tableItem to item 5 of argv
+  set basicItem to item 6 of argv
   tell application "${resolveAppName("Pages")}"
     activate
     try
@@ -163,16 +399,16 @@ on run argv
       repeat while yOff < (sh - 100)
         click at {sx + (sw div 2), sy + yOff}
         delay 0.4
-        if enabled of menu item "Basic" of menu "Table" of menu item "Table" of menu "Insert" of menu bar 1 then
+        if enabled of menu item basicItem of menu tableItem of menu item tableItem of menu insertMenu of menu bar 1 then
           set ok to true
           exit repeat
         end if
         set yOff to yOff + 70
       end repeat
       if not ok then error "Could not place an insertion point in the document body to insert the table. Make sure this app has Accessibility permission (System Settings > Privacy & Security > Accessibility) and the document body is editable."
-      click menu item "Table" of menu "Insert" of menu bar 1
+      click menu item tableItem of menu insertMenu of menu bar 1
       delay 0.4
-      click menu item "Basic" of menu "Table" of menu item "Table" of menu "Insert" of menu bar 1
+      click menu item basicItem of menu tableItem of menu item tableItem of menu insertMenu of menu bar 1
     end tell
   end tell
   delay 1.0
@@ -197,7 +433,7 @@ end run
   try {
     const { stdout } = await execFileAsync(
       "/usr/bin/osascript",
-      ["-e", script, resolvedDocName, String(rows ?? 0), String(columns ?? 0)],
+      ["-e", script, resolvedDocName, String(rows ?? 0), String(columns ?? 0), insertMenu, tableItem, basicItem],
       { timeout: 30_000 },
     );
     return stdout.trim();
@@ -243,6 +479,20 @@ async function writtenSince(path: string, sinceMs: number): Promise<string | nul
   }
 }
 
+/**
+ * Whether a document file is an untitled draft: auto-saved by the app (iCloud, Creator Studio)
+ * but never saved by the user. AppKit marks those with the com.apple.document.draft attribute
+ * and removes it on the first real save. A plain save of a draft opens a Save sheet and blocks.
+ */
+export async function isDraftFile(path: string): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync("/usr/bin/xattr", [path], { timeout: 5_000 });
+    return stdout.split("\n").some((name) => name.startsWith("com.apple.document.draft"));
+  } catch {
+    return false;
+  }
+}
+
 // Documents this server created that haven't been saved to a user path yet
 const createdDocuments = new Set<string>();
 
@@ -256,18 +506,53 @@ function createdKey(appName: IWorkApp, name: string): string {
   return `${appName}:${name.endsWith(ext) ? name.slice(0, -ext.length) : name}`;
 }
 
-/** The iCloud auto-save of a document a tool created, or null. */
-export async function untitledAutoSavePath(appName: IWorkApp, documentName: string): Promise<string | null> {
-  if (!createdDocuments.has(createdKey(appName, documentName))) return null;
-  const path = await runJXA<string | null>(
+/** The file of an open document, or null if it has none (or the lookup fails). */
+async function documentFile(appName: IWorkApp, documentName: string): Promise<string | null> {
+  return runJXA<string | null>(
     `
     const f = Application("${resolveAppName(appName)}").documents.byName(params.documentName).file();
     return JSON.stringify(f ? f.toString() : null);
     `,
     { documentName },
-    { label: "untitledAutoSavePath" },
+    { label: "documentFile" },
   ).catch(() => null);
-  return path && path.includes("/Library/Mobile Documents/") ? path : null;
+}
+
+/**
+ * The iCloud auto-save of an untitled document, or null: a draft (new or imported,
+ * never saved — also one created before a server restart), or a document a tool created.
+ */
+export async function untitledAutoSavePath(appName: IWorkApp, documentName: string): Promise<string | null> {
+  const path = await documentFile(appName, documentName);
+  if (!path || !path.includes("/Library/Mobile Documents/")) return null;
+  return createdDocuments.has(createdKey(appName, documentName)) || await isDraftFile(path) ? path : null;
+}
+
+/**
+ * Close a document. A draft can't be saved in place (a Save sheet would open and block),
+ * so saving "yes" on one is an error; saving "no" also moves its iCloud draft to the
+ * Trash, which Creator Studio would otherwise keep (closing it in the app deletes it).
+ */
+export async function closeDocument(appName: IWorkApp, documentName: string, saving?: "yes" | "no" | "ask"): Promise<string> {
+  if (saving === "yes") {
+    const file = await documentFile(appName, documentName);
+    if (file && await isDraftFile(file)) {
+      throw new Error('The document has never been saved (it is new or was imported from another format); save it with a filePath first, or close it with saving "no"');
+    }
+  }
+  const autoSave = saving === "no" ? await untitledAutoSavePath(appName, documentName) : null;
+  const result = await runJXA<string>(
+    `
+    const doc = Application("${resolveAppName(appName)}").documents.byName(params.documentName);
+    if (params.saving) doc.close({ saving: params.saving });
+    else doc.close();
+    return JSON.stringify(params.trashDraft ? { closed: true, draftTrashed: true } : { closed: true });
+    `,
+    { documentName, saving: saving ?? null, trashDraft: Boolean(autoSave) },
+    { label: "closeDocument" },
+  );
+  if (autoSave) await trashUntitledAutoSave(appName, documentName, autoSave);
+  return result;
 }
 
 /** Move a tool-created document's untitled auto-save to the Trash once no open document uses it. */
@@ -399,7 +684,7 @@ export async function creatorStudioExportPDF(
       if (f) return f.toString();
       delay(1);
     }
-    throw new Error("Timed out waiting for document auto-save path");
+    throw new Error("The document has no file on disk yet, and this PDF export works from the saved file. Save it with a file path first.");
     `,
     { documentName },
     { timeout: 20_000, label: "creatorStudioExportPDF:getFile" },
@@ -412,17 +697,90 @@ export async function creatorStudioExportPDF(
       timeout: 30_000,
     });
 
-    // Find the generated PDF
+    // The preview can hold several PDF attachments (Attachment1.pdf, Attachment2.pdf, ...)
     const { stdout } = await execFileAsync("/usr/bin/find", [tmpDir, "-name", "*.pdf", "-type", "f"]);
-    const pdfPath = stdout.trim().split("\n")[0];
-    if (!pdfPath) {
+    const pdfs = stdout.split("\n").filter(Boolean).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    if (pdfs.length === 0) {
       throw new Error("Quick Look did not generate a PDF preview for this document");
     }
-
-    await copyFile(pdfPath, targetPath);
+    if (pdfs.length === 1) {
+      await copyFile(pdfs[0], targetPath);
+      return;
+    }
+    await runJXA<void>(
+      `
+      ObjC.import("Quartz");
+      const out = $.PDFDocument.alloc.init;
+      for (const path of params.pdfs) {
+        const part = $.PDFDocument.alloc.initWithURL($.NSURL.fileURLWithPath(path));
+        if (!part || part.isNil()) throw new Error("Could not read " + path);
+        for (let i = 0; i < Number(part.pageCount); i++) out.insertPageAtIndex(part.pageAtIndex(i), Number(out.pageCount));
+      }
+      if (!out.writeToFile(params.targetPath)) throw new Error("Could not write PDF to " + params.targetPath);
+      `,
+      { pdfs, targetPath },
+      { timeout: 60_000, label: "creatorStudioExportPDF:merge" },
+    );
   } finally {
     await rm(tmpDir, { recursive: true, force: true });
   }
+}
+
+async function pdfPageCount(path: string): Promise<number | null> {
+  return runJXA<number | null>(
+    `
+    ObjC.import("Quartz");
+    const pdf = $.PDFDocument.alloc.initWithURL($.NSURL.fileURLWithPath(params.path));
+    return JSON.stringify(pdf && !pdf.isNil() ? Number(pdf.pageCount) : null);
+    `,
+    { path },
+    { timeout: 20_000, label: "pdfPageCount" },
+  );
+}
+
+/**
+ * Creator Studio PDF export for Pages. Quick Look may render only the first page,
+ * so try the native export first and compare the PDF's page count with the document's.
+ */
+export async function creatorStudioPagesExportPDF(
+  documentName: string,
+  targetPath: string,
+): Promise<{ method: "native" | "Quick Look"; pageCount: number | null; documentPageCount: number | null }> {
+  const documentPageCount = await runJXA<number | null>(
+    `
+    const doc = Application("Pages").documents.byName(params.documentName);
+    try { return JSON.stringify(doc.pages.length); } catch (e) { return JSON.stringify(null); }
+    `,
+    { documentName },
+    { timeout: 20_000, label: "creatorStudioPagesExportPDF:pages" },
+  );
+
+  const mtimeBefore = existsSync(targetPath) ? (await stat(targetPath)).mtimeMs : -1;
+  let method: "native" | "Quick Look" = "native";
+  try {
+    await runJXA<void>(
+      `
+      const app = Application("Pages");
+      app.export(app.documents.byName(params.documentName), { to: Path(params.targetPath), as: "PDF" });
+      `,
+      { documentName, targetPath },
+      { timeout: 60_000, label: "creatorStudioPagesExportPDF:native" },
+    );
+  } catch {}
+  if (!existsSync(targetPath) || (await stat(targetPath)).mtimeMs <= mtimeBefore) {
+    method = "Quick Look";
+    await creatorStudioExportPDF("Pages", documentName, targetPath);
+  }
+
+  const pageCount = await pdfPageCount(targetPath);
+  if (pageCount !== null && documentPageCount !== null && pageCount < documentPageCount) {
+    await rm(targetPath, { force: true });
+    throw new Error(
+      `PDF export is incomplete: ${method} produced ${pageCount} of ${documentPageCount} pages, so the file was not kept. ` +
+        "Export the PDF from Pages by hand (File > Export To > PDF).",
+    );
+  }
+  return { method, pageCount, documentPageCount };
 }
 
 /**
@@ -536,6 +894,17 @@ export function injectDocumentNameResolution(script: string): string {
 
   const injection = `
   // [iwork-mcp] Creator Studio document name resolution
+  {
+    // Untitled documents are renamed on auto-save ("X" -> "X${ext}"), so a new
+    // "X" can coexist with it; refuse to guess which one is meant
+    let __names = [];
+    try { __names = ${appExpr}.documents.name(); } catch(__e) {}
+    const __matches = __names.filter(function (n) { return n === params.documentName || n === params.documentName + ${JSON.stringify(ext)}; });
+    if (__matches.length > 1) {
+      throw new Error("Several open documents match the name " + JSON.stringify(params.documentName) + " (" + __matches.join(", ") +
+        "). Save or close one of them first so each has its own name.");
+    }
+  }
   try {
     const __app = ${appExpr};
     __app.documents.byName(params.documentName).name();
@@ -570,7 +939,10 @@ export class OsascriptError extends Error {
 
   constructor(stderr: string, exitCode: number | null) {
     const errorCode = parseErrorCode(stderr);
-    const friendly = errorCode !== undefined ? COMMON_ERRORS[errorCode] : undefined;
+    // -1719 is also "invalid index"; from System Events it means UI scripting isn't allowed
+    const friendly = errorCode === -1719 && stderr.includes("System Events")
+      ? "Accessibility permission missing. Open System Settings → Privacy & Security → Accessibility and allow the app running this server (e.g. Claude or your terminal)."
+      : errorCode !== undefined ? COMMON_ERRORS[errorCode] : undefined;
     const message = friendly
       ? `${friendly}\n\nosascript stderr: ${stderr}`
       : `osascript failed (exit ${exitCode}): ${stderr}`;

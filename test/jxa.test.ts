@@ -128,6 +128,13 @@ describe("injectDocumentNameResolution", () => {
     assert.doesNotThrow(() => new Function(result));
   });
 
+  it("refuses names that match several open documents", () => {
+    const script = fakeScript("Pages Creator Studio", true);
+    const result = injectDocumentNameResolution(script);
+    assert.ok(result.includes("Several open documents match the name"));
+    assert.doesNotThrow(() => new Function(result));
+  });
+
   it("injects after the params line, before the script body", () => {
     const script = fakeScript("Numbers Creator Studio", true);
     const result = injectDocumentNameResolution(script);

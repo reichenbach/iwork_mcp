@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioExportPDF, saveTimeout, clickMenuItem, resolveAppName, pagesInsertTableViaUI } from "../jxa.js";
+import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioPagesExportPDF, saveTimeout, clickMenuItem, resolveAppName, pagesInsertTableViaUI, isDraftFile, selectForMenu, closeDocument } from "../jxa.js";
 import { ANNOTATIONS } from "../annotations.js";
 
 function toolResult(text: string, isError = false) {
@@ -35,6 +35,86 @@ async function handleJXA<T>(fn: () => Promise<T>): Promise<{ content: { type: "t
 }
 
 export function registerPagesTools(server: McpServer): void {
+  // The text tools edit the body in place. Setting doc.bodyText (or a whole paragraph)
+  // resets the formatting of everything it covers, character styles and paragraph
+  // styles alike, and deletes the inline images and tables anchored there (U+FFFC in
+  // the text). Setting one character to a string replaces just that character, and the
+  // new text takes its formatting; deleting a character range leaves the rest alone.
+  // Pages counts characters in code points, so positions index Array.from(bodyText),
+  // not the UTF-16 string (an emoji is one character to Pages, two string units to JS).
+  // Pages ends a paragraph at "\\n" and at a page break ("\\f").
+  const BODY_EDIT_HELPERS = `
+    ObjC.import("Foundation");
+    const OBJECT_CHAR = "\\uFFFC";
+    function openDoc(name) {
+      // By id: Creator Studio's auto-save renames the document after an edit
+      const app = Application("Pages");
+      return app.documents.byId(app.documents.byName(name).id());
+    }
+    // The body as an array of characters, indexed like doc.bodyText.characters. The edit
+    // functions below keep a copy of what the body should become, for checkBody.
+    let expectedBody = null;
+    function bodyChars(doc) {
+      const chars = Array.from(doc.bodyText());
+      expectedBody = chars.slice();
+      return chars;
+    }
+    function setBody(doc, s) {
+      doc.bodyText = s;
+      expectedBody = Array.from(s);
+    }
+    // Pages sometimes ignores a scripted text change without an error (seen while the
+    // document's window was in the middle of an edit), so compare the body with what the
+    // edits should have produced instead of reporting success regardless.
+    function checkBody(doc) {
+      if (doc.bodyText() !== expectedBody.join("")) {
+        throw new Error("Pages did not apply the change to the body text. Its window may be in the middle of an edit: click into the document, or close and reopen it, and try again.");
+      }
+    }
+    // One entry per paragraph, matching doc.bodyText.paragraphs: its characters are
+    // text.slice(start, end), and sep ("\\n", "\\f" or "" for the last) sits at end.
+    function paraBounds(text) {
+      const paras = [];
+      let start = 0;
+      for (let i = 0; i < text.length; i++) {
+        if (text[i] === "\\n" || text[i] === "\\f") {
+          paras.push({ start: start, end: i, sep: text[i] });
+          start = i + 1;
+        }
+      }
+      paras.push({ start: start, end: text.length, sep: "" });
+      return paras;
+    }
+    function setChar(doc, index, s) {
+      doc.bodyText.characters[index] = s;
+      Array.prototype.splice.apply(expectedBody, [index, 1].concat(Array.from(s)));
+    }
+    // A character next to which text goes in. An inline object can't be the one: setting
+    // it to a string deletes the object.
+    function editableChar(body, index) {
+      if (body[index] === OBJECT_CHAR) {
+        throw new Error("Can't add text here without removing the inline image or table next to it. Insert the text at another paragraph.");
+      }
+      return body[index];
+    }
+    function runAS(src) {
+      const err = $();
+      const result = $.NSAppleScript.alloc.initWithSource(src).executeAndReturnError(err);
+      if (!result || (result.isNil && result.isNil())) {
+        const info = ObjC.deepUnwrap(err) || {};
+        throw new Error(info.NSAppleScriptErrorBriefMessage || info.NSAppleScriptErrorMessage || "AppleScript execution failed");
+      }
+      return result;
+    }
+    function charRange(doc, from, to) {  // 0-based, inclusive
+      return "characters " + (from + 1) + " thru " + (to + 1) + ' of body text of document id "' + doc.id() + '"';
+    }
+    function deleteChars(doc, from, to) {
+      if (to < from) return;
+      runAS('tell application "Pages" to delete (' + charRange(doc, from, to) + ")");
+      expectedBody.splice(from, to - from + 1);
+    }
+  `;
   // ── Document Management ──
 
   server.tool(
@@ -83,16 +163,23 @@ export function registerPagesTools(server: McpServer): void {
 
   server.tool(
     "pages_open_document",
-    "Open a .pages file from disk",
+    "Open a document from disk: .pages, or Word, RTF and plain text files (imported as a new, unsaved document)",
     {
-      filePath: z.string().startsWith("/").describe("Absolute path to the .pages file"),
+      filePath: z.string().startsWith("/").describe("Absolute path to the file"),
     },
     ANNOTATIONS.readWrite,
-    async ({ filePath }) => handleJXA(() => runJXA<string>(`
+    async ({ filePath }) => handleJXA(async () => {
+      // Pages shows a modal alert for missing or unsupported files, which blocks every later call
+      if (!existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
+      if (!/\.(pages|docx?|dotx|rtfd?|txt|md|markdown)$/i.test(filePath)) {
+        throw new Error(`Pages can't open this file type: ${filePath}`);
+      }
+      return runJXA<string>(`
       const app = Application("Pages");
       const doc = app.open(Path(params.filePath));
       return JSON.stringify({ name: doc.name() });
-    `, { filePath })),
+    `, { filePath });
+    }),
   );
 
   server.tool(
@@ -104,6 +191,16 @@ export function registerPagesTools(server: McpServer): void {
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, filePath }) => handleJXA(async () => {
+      if (!filePath) {
+        // New and imported documents only have an auto-saved draft; saving one opens a Save sheet that blocks
+        const file = await runJXA<string | null>(`
+      const f = Application("Pages").documents.byName(params.documentName).file();
+      return JSON.stringify(f ? f.toString() : null);
+    `, { documentName });
+        if (!file || await isDraftFile(file)) {
+          throw new Error("The document has never been saved (it is new or was imported from another format); pass filePath to choose where to save it");
+        }
+      }
       if (isCreatorStudio()) {
         if (filePath) {
           const { name, reopened } = await creatorStudioSaveAs("Pages", documentName, filePath);
@@ -111,7 +208,12 @@ export function registerPagesTools(server: McpServer): void {
             ? { saved: true, name }
             : { saved: true, name, reopened: false, note: `Saved, but Pages did not reopen the file; open it with pages_open_document if needed.` });
         }
-        return JSON.stringify({ saved: true, name: documentName });
+        return runJXA<string>(`
+      ${PAGES_TABLE_HELPERS}
+      const doc = Application("Pages").documents.byName(params.documentName);
+      runAS('tell application "Pages" to save ' + docRef());
+      return JSON.stringify({ saved: true, name: doc.name() });
+    `, { documentName }, { timeout: saveTimeout(), label: "pages:save" });
       }
       return runJXA<string>(`
       const app = Application("Pages");
@@ -139,9 +241,16 @@ export function registerPagesTools(server: McpServer): void {
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, filePath, format }) => handleJXA(async () => {
+      const ext = { PDF: [".pdf"], Word: [".docx"], EPUB: [".epub"], Text: [".txt"] }[format];
+      if (!ext.some((e) => filePath.toLowerCase().endsWith(e))) {
+        throw new Error(`filePath must end in ${ext.join(" or ")} for ${format} export`);
+      }
       if (isCreatorStudio() && format === "PDF") {
-        await creatorStudioExportPDF("Pages", documentName, filePath);
-        return JSON.stringify({ exported: true, path: filePath, format: "PDF" });
+        const { method, pageCount, documentPageCount } = await creatorStudioPagesExportPDF(documentName, filePath);
+        const result: Record<string, unknown> = { exported: true, path: filePath, format: "PDF", method, pageCount };
+        if (method === "Quick Look") result.note = "Exported from the last saved state of the document";
+        if (pageCount === null || documentPageCount === null) result.warning = "Could not check the page count of the exported PDF";
+        return JSON.stringify(result);
       }
       return runJXA<string>(`
       const app = Application("Pages");
@@ -161,23 +270,13 @@ export function registerPagesTools(server: McpServer): void {
 
   server.tool(
     "pages_close_document",
-    "Close a Pages document",
+    "Close a Pages document. With saving \"no\", a document that was never saved (new, or imported from another format) is discarded, including its iCloud draft (moved to the Trash). Such a document can't be closed with saving \"yes\": save it with a file path first.",
     {
       documentName: z.string().describe("Name of the open document"),
       saving: z.enum(["yes", "no", "ask"]).optional().describe("Whether to save before closing"),
     },
     ANNOTATIONS.destructive,
-    async ({ documentName, saving }) => handleJXA(() => runJXA<string>(`
-      const app = Application("Pages");
-      const doc = app.documents.byName(params.documentName);
-      const saveOpts = { yes: "yes", no: "no", ask: "ask" };
-      if (params.saving) {
-        doc.close({ saving: saveOpts[params.saving] });
-      } else {
-        doc.close();
-      }
-      return JSON.stringify({ closed: true });
-    `, { documentName, saving: saving ?? null })),
+    async ({ documentName, saving }) => handleJXA(() => closeDocument("Pages", documentName, saving)),
   );
 
   // ── Text Reading Tools ──
@@ -212,7 +311,7 @@ export function registerPagesTools(server: McpServer): void {
       const result = [];
       for (let i = 0; i < count; i++) {
         const p = paras[i];
-        const text = p();
+        const text = p().replace(/\\n$/, "");
         if (text === "" && i === count - 1) continue;  // skip trailing empty paragraph
         const entry = { index: i, text: text };
         try { entry.font = p.font(); } catch(e) {}
@@ -256,7 +355,7 @@ export function registerPagesTools(server: McpServer): void {
 
   server.tool(
     "pages_list_images",
-    "List all images in a Pages document with their positions and sizes",
+    "List all images in a Pages document with their positions and sizes (index is 0-based)",
     {
       documentName: z.string().describe("Name of the open document"),
     },
@@ -284,188 +383,179 @@ export function registerPagesTools(server: McpServer): void {
 
   server.tool(
     "pages_add_text",
-    "Append text to the end of the document body (preserves existing formatting). Include a trailing newline to start a new paragraph.",
+    "Append text to the end of the document body. It takes the formatting of the text it follows; existing text, images and tables are left as they are. Include a trailing newline to start a new paragraph.",
     {
       documentName: z.string().describe("Name of the open document"),
       text: z.string().describe("Text to append (include trailing newline for a new paragraph)"),
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, text }) => handleJXA(() => runJXA<string>(`
-      const app = Application("Pages");
-      const doc = app.documents.byName(params.documentName);
-      // Save formatting on all existing paragraphs
-      const paras = doc.bodyText.paragraphs;
-      const count = paras.length;
-      const formats = [];
-      for (let i = 0; i < count; i++) {
-        try { formats.push({ font: paras[i].font(), size: paras[i].size(), color: paras[i].color() }); }
-        catch(e) { formats.push(null); }
-      }
-      // Append
-      doc.bodyText = doc.bodyText() + params.text;
-      // Restore formatting on pre-existing paragraphs
-      for (let i = 0; i < formats.length; i++) {
-        if (!formats[i]) continue;
-        try {
-          const p = doc.bodyText.paragraphs[i];
-          p.font = formats[i].font;
-          p.size = formats[i].size;
-          p.color = formats[i].color;
-        } catch(e) {}
-      }
+      ${BODY_EDIT_HELPERS}
+      const doc = openDoc(params.documentName);
+      const body = bodyChars(doc);
+      if (!body.length) setBody(doc, params.text);
+      else if (params.text) setChar(doc, body.length - 1, editableChar(body, body.length - 1) + params.text);
+      checkBody(doc);
       return JSON.stringify({ appended: true, paragraphCount: doc.bodyText.paragraphs.length });
     `, { documentName, text })),
   );
 
   server.tool(
     "pages_insert_text_at",
-    "Insert text at a specific paragraph index (preserves formatting on other paragraphs)",
+    "Insert text as new paragraphs after a paragraph. The new paragraphs get the character and paragraph formatting of the paragraph before them (of paragraph 0 when inserting at the beginning); other text, images and tables are left as they are.",
     {
       documentName: z.string().describe("Name of the open document"),
-      text: z.string().describe("Text to insert (include trailing newline)"),
+      text: z.string().describe("Text to insert; newlines separate paragraphs (a trailing newline is ignored)"),
       afterParagraph: z.number().int().min(-1).describe("Insert after this paragraph index (0-based). Use -1 to insert at the beginning."),
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, text, afterParagraph }) => handleJXA(() => runJXA<string>(`
-      const app = Application("Pages");
-      const doc = app.documents.byName(params.documentName);
-      // Save formatting
-      const paras = doc.bodyText.paragraphs;
-      const count = paras.length;
-      const formats = [];
-      for (let i = 0; i < count; i++) {
-        try { formats.push({ font: paras[i].font(), size: paras[i].size(), color: paras[i].color() }); }
-        catch(e) { formats.push(null); }
+      ${BODY_EDIT_HELPERS}
+      const doc = openDoc(params.documentName);
+      const body = bodyChars(doc);
+      const paras = paraBounds(body);
+      if (params.afterParagraph >= paras.length) {
+        throw new Error("Paragraph index " + params.afterParagraph + " out of range (0-" + (paras.length - 1) + ")");
       }
-      // Insert via string manipulation
-      const bt = doc.bodyText();
-      const lines = bt.split("\\n");
-      const insertIdx = params.afterParagraph < 0 ? 0 : params.afterParagraph + 1;
       const newText = params.text.endsWith("\\n") ? params.text.slice(0, -1) : params.text;
-      const nlCount = (newText.match(/\\n/g) || []).length;
-      lines.splice(insertIdx, 0, newText);
-      doc.bodyText = lines.join("\\n");
-      // Restore formatting (shift indices after insert point by number of new paragraphs)
-      for (let i = 0; i < formats.length; i++) {
-        if (!formats[i]) continue;
-        const newIdx = i < insertIdx ? i : i + nlCount + 1;
-        try {
-          const p = doc.bodyText.paragraphs[newIdx];
-          p.font = formats[i].font;
-          p.size = formats[i].size;
-          p.color = formats[i].color;
-        } catch(e) {}
+      if (!body.length) {
+        setBody(doc, params.afterParagraph < 0 ? newText + "\\n" : "\\n" + newText);
+      } else if (params.afterParagraph < 0) {
+        setChar(doc, 0, newText + "\\n" + editableChar(body, 0));
+      } else {
+        const p = paras[params.afterParagraph];
+        // Replace the paragraph's separator with itself plus the new paragraphs; after the
+        // last paragraph, which has none, extend its last character instead.
+        if (p.sep) setChar(doc, p.end, p.sep + newText + "\\n");
+        else setChar(doc, body.length - 1, editableChar(body, body.length - 1) + "\\n" + newText);
       }
+      checkBody(doc);
       return JSON.stringify({ inserted: true, paragraphCount: doc.bodyText.paragraphs.length });
     `, { documentName, text, afterParagraph })),
   );
 
   server.tool(
     "pages_delete_text",
-    "Delete a paragraph by index (preserves formatting on other paragraphs)",
+    "Delete a paragraph by index, with any inline images or tables in it. Other paragraphs keep their text and formatting.",
     {
       documentName: z.string().describe("Name of the open document"),
       paragraphIndex: z.number().int().min(0).describe("Paragraph index to delete (0-based)"),
     },
     ANNOTATIONS.destructive,
     async ({ documentName, paragraphIndex }) => handleJXA(() => runJXA<string>(`
-      const app = Application("Pages");
-      const doc = app.documents.byName(params.documentName);
-      // Save formatting
-      const paras = doc.bodyText.paragraphs;
-      const count = paras.length;
-      const formats = [];
-      for (let i = 0; i < count; i++) {
-        try { formats.push({ font: paras[i].font(), size: paras[i].size(), color: paras[i].color() }); }
-        catch(e) { formats.push(null); }
+      ${BODY_EDIT_HELPERS}
+      const doc = openDoc(params.documentName);
+      const paras = paraBounds(bodyChars(doc));
+      const i = params.paragraphIndex;
+      if (i < 0 || i >= paras.length) {
+        throw new Error("Paragraph index " + i + " out of range (0-" + (paras.length - 1) + ")");
       }
-      // Delete via string manipulation
-      const lines = doc.bodyText().split("\\n");
-      if (params.paragraphIndex < 0 || params.paragraphIndex >= lines.length) {
-        throw new Error("Paragraph index " + params.paragraphIndex + " out of range (0-" + (lines.length - 1) + ")");
-      }
-      lines.splice(params.paragraphIndex, 1);
-      formats.splice(params.paragraphIndex, 1);
-      doc.bodyText = lines.join("\\n");
-      // Restore formatting
-      for (let i = 0; i < formats.length; i++) {
-        if (!formats[i]) continue;
-        try {
-          const p = doc.bodyText.paragraphs[i];
-          p.font = formats[i].font;
-          p.size = formats[i].size;
-          p.color = formats[i].color;
-        } catch(e) {}
-      }
+      const p = paras[i];
+      if (paras.length === 1) deleteChars(doc, p.start, p.end - 1);
+      // The last paragraph, or one that ends with a page break: delete it together with the
+      // separator before it, so the paragraph before ends the body or takes over the break.
+      else if (i > 0 && p.sep !== "\\n") deleteChars(doc, paras[i - 1].end, p.end - 1);
+      else deleteChars(doc, p.start, p.end);
+      checkBody(doc);
       return JSON.stringify({ deleted: true, paragraphCount: doc.bodyText.paragraphs.length });
     `, { documentName, paragraphIndex })),
   );
 
   server.tool(
     "pages_replace_text",
-    "Find and replace text in a Pages document (preserves formatting)",
+    "Find and replace text in a Pages document. The replacement takes the formatting of the first character it replaces; the rest of the paragraph, other text, inline images and tables are left as they are.",
     {
       documentName: z.string().describe("Name of the open document"),
-      find: z.string().describe("Text to find"),
+      find: z.string().min(1).describe("Text to find"),
       replace: z.string().describe("Replacement text"),
       all: z.boolean().optional().describe("Replace all occurrences (default: true)"),
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, find, replace, all }) => handleJXA(() => runJXA<string>(`
-      const app = Application("Pages");
-      const doc = app.documents.byName(params.documentName);
-      const paras = doc.bodyText.paragraphs;
-      const count = paras.length;
-      let total = 0;
-      for (let i = 0; i < count; i++) {
-        const text = paras[i]();
-        if (text.indexOf(params.find) === -1) continue;
-        if (params.all !== false) {
-          const parts = text.split(params.find);
-          total += parts.length - 1;
-          doc.bodyText.paragraphs[i] = parts.join(params.replace);
-        } else if (total === 0) {
-          const idx = text.indexOf(params.find);
-          doc.bodyText.paragraphs[i] = text.substring(0, idx) + params.replace + text.substring(idx + params.find.length);
-          total = 1;
-          break;
+      ${BODY_EDIT_HELPERS}
+      const doc = openDoc(params.documentName);
+      const text = bodyChars(doc).join("");
+      const findLength = Array.from(params.find).length;
+      const replaceLength = Array.from(params.replace).length;
+      // Character positions of the matches (code points, like doc.bodyText.characters)
+      const hits = [];
+      let from = 0, pos = 0, idx;
+      while ((idx = text.indexOf(params.find, from)) !== -1) {
+        pos += Array.from(text.slice(from, idx)).length;
+        hits.push(pos);
+        pos += findLength;
+        from = idx + params.find.length;
+        if (params.all === false) break;
+      }
+      // From the last match back, so the positions before it stay valid
+      for (let h = hits.length - 1; h >= 0; h--) {
+        const k = hits[h];
+        if (!replaceLength) {
+          deleteChars(doc, k, k + findLength - 1);
+        } else {
+          setChar(doc, k, params.replace);
+          // Make sure Pages took the first change before deleting the rest of the match
+          if (h === hits.length - 1) checkBody(doc);
+          deleteChars(doc, k + replaceLength, k + replaceLength + findLength - 2);
         }
       }
-      return JSON.stringify({ replacements: total });
+      if (hits.length) checkBody(doc);
+      return JSON.stringify({ replacements: hits.length });
     `, { documentName, find, replace, all: all ?? true })),
   );
 
   server.tool(
     "pages_format_text",
-    "Set formatting on a paragraph: font (PostScript name), size, color. For bold use a bold font name like 'HelveticaNeue-Bold', for italic use 'HelveticaNeue-Italic'.",
+    "Set formatting on a paragraph, or on part of it: font (PostScript name), size, color. For bold use a bold font name like 'HelveticaNeue-Bold', for italic use 'HelveticaNeue-Italic'. Pass text to format only the first occurrence of that text in the paragraph, e.g. a bold 'Figure 1:' at the start of a caption.",
     {
       documentName: z.string().describe("Name of the open document"),
       paragraphIndex: z.number().int().min(0).describe("Paragraph index (0-based)"),
+      text: z.string().min(1).optional().describe("Format only the first occurrence of this text in the paragraph (default: the whole paragraph)"),
       format: z.object({
         fontSize: z.number().positive().optional().describe("Font size in points"),
         fontName: z.string().optional().describe("PostScript font name (e.g. 'HelveticaNeue-Bold' for bold, 'Georgia-Italic' for italic)"),
         textColor: z.string().regex(/^#[0-9A-Fa-f]{6}$/).optional().describe("Text color as hex, e.g. '#FF0000'"),
-      }).describe("Formatting options"),
+      }).refine((f) => Object.values(f).some((v) => v !== undefined), "Set at least one of fontSize, fontName or textColor").describe("Formatting options"),
     },
     ANNOTATIONS.readWrite,
-    async ({ documentName, paragraphIndex, format }) => handleJXA(() => runJXA<string>(`
-      const app = Application("Pages");
-      const doc = app.documents.byName(params.documentName);
-      const paragraph = doc.bodyText.paragraphs[params.paragraphIndex];
+    async ({ documentName, paragraphIndex, text, format }) => handleJXA(() => runJXA<string>(`
+      ${BODY_EDIT_HELPERS}
+      const doc = openDoc(params.documentName);
+      const paraCount = doc.bodyText.paragraphs.length;
+      if (params.paragraphIndex >= paraCount) {
+        throw new Error("Paragraph index " + params.paragraphIndex + " out of range (0-" + (paraCount - 1) + ")");
+      }
       const fmt = params.format;
-
-      if (fmt.fontSize !== undefined) paragraph.size = fmt.fontSize;
-      if (fmt.fontName !== undefined) paragraph.font = fmt.fontName;
+      let color = null;
       if (fmt.textColor !== undefined) {
         const hex = fmt.textColor;
-        const r = parseInt(hex.slice(1, 3), 16) * 257;
-        const g = parseInt(hex.slice(3, 5), 16) * 257;
-        const b = parseInt(hex.slice(5, 7), 16) * 257;
-        paragraph.color = [r, g, b];
+        color = [parseInt(hex.slice(1, 3), 16) * 257, parseInt(hex.slice(3, 5), 16) * 257, parseInt(hex.slice(5, 7), 16) * 257];
       }
 
-      return JSON.stringify({ formatted: true, paragraphIndex: params.paragraphIndex });
-    `, { documentName, paragraphIndex, format })),
+      if (params.text === null) {
+        const paragraph = doc.bodyText.paragraphs[params.paragraphIndex];
+        if (fmt.fontSize !== undefined) paragraph.size = fmt.fontSize;
+        if (fmt.fontName !== undefined) paragraph.font = fmt.fontName;
+        if (color) paragraph.color = color;
+        return JSON.stringify({ formatted: true, paragraphIndex: params.paragraphIndex });
+      }
+
+      // Part of the paragraph: set the properties on a character range through AppleScript
+      const chars = bodyChars(doc);
+      const p = paraBounds(chars)[params.paragraphIndex];
+      const paraText = chars.slice(p.start, p.end).join("");
+      const idx = paraText.indexOf(params.text);
+      if (idx === -1) throw new Error(JSON.stringify(params.text) + " not found in paragraph " + params.paragraphIndex);
+      const from = p.start + Array.from(paraText.slice(0, idx)).length;
+      const range = "(" + charRange(doc, from, from + Array.from(params.text).length - 1) + ")";
+      const lines = [];
+      if (fmt.fontSize !== undefined) lines.push("set size of " + range + " to " + fmt.fontSize);
+      // A JSON string is a valid AppleScript string for a font name (no control characters)
+      if (fmt.fontName !== undefined) lines.push("set font of " + range + " to " + JSON.stringify(fmt.fontName));
+      if (color) lines.push("set color of " + range + " to {" + color.join(", ") + "}");
+      runAS('tell application "Pages"\\n' + lines.join("\\n") + "\\nend tell");
+      return JSON.stringify({ formatted: true, paragraphIndex: params.paragraphIndex, text: params.text });
+    `, { documentName, paragraphIndex, text: text ?? null, format })),
   );
 
   server.tool(
@@ -651,7 +741,7 @@ export function registerPagesTools(server: McpServer): void {
 
   server.tool(
     "pages_write_table_cells",
-    "Write values into table cells in a Pages document (1-based row/column). Strings starting with '=' become formulas (e.g. '=SUM(D2:D5)'). Existing formulas in other cells recalculate automatically. By default the table grows to fit out-of-range writes.",
+    "Write values into table cells in a Pages document (1-based row/column). Strings starting with '=' become formulas (e.g. '=SUM(D2:D5)'); formulas read back with the app's localized function names. Strings that would lose digits as numbers (e.g. '0049') are stored as text; booleans are written as =TRUE()/=FALSE() so they read back as true/false. Existing formulas in other cells recalculate automatically. By default the table grows to fit out-of-range writes.",
     {
       documentName: z.string().describe("Name of the open document"),
       tableIndex: z.number().int().min(1).optional().describe("Table index, 1-based (default: 1)"),
@@ -676,7 +766,19 @@ export function registerPagesTools(server: McpServer): void {
         body += 'if column count < ' + maxCol + ' then set column count to ' + maxCol + '\\n';
       }
       for (const c of params.cells) {
-        body += 'set value of cell ' + c.column + ' of row ' + c.row + ' to ' + asValue(c.value) + '\\n';
+        const cellAS = 'cell ' + c.column + ' of row ' + c.row;
+        // Keep strings like "0049" or "1.50" as text instead of numbers. Booleans would be stored
+        // as 1/0 (Pages can't set the checkbox format by script), but TRUE()/FALSE() keep the type.
+        const v = c.value;
+        const lossy = typeof v === "string" && v.trim() !== "" && v[0] !== "=" && !isNaN(Number(v)) && String(Number(v)) !== v;
+        // A cell holding a boolean coerces whatever is written next (7 or "0049" -> true) and
+        // refuses the text format; emptying it first resets the type, the format stays
+        if (v !== null) body += 'set value of ' + cellAS + ' to ""\\n';
+        if (lossy) body += 'try\\nset format of ' + cellAS + ' to text\\nend try\\n';
+        // In a text-formatted cell a formula would be stored as plain text
+        if (typeof v === "boolean" || (typeof v === "string" && v[0] === "=")) body += 'try\\nset format of ' + cellAS + ' to automatic\\nend try\\n';
+        const asV = typeof v === "boolean" ? asQuote(v ? "=TRUE()" : "=FALSE()") : asValue(v);
+        body += 'set value of ' + cellAS + ' to ' + asV + '\\n';
       }
       const src = 'tell application "Pages"\\n' +
         'tell ' + tableRef() + '\\n' +
@@ -720,47 +822,33 @@ export function registerPagesTools(server: McpServer): void {
 
   server.tool(
     "pages_insert_page_break",
-    "Insert a page break after a specific paragraph. Creates a visual page break in the document.",
+    "Insert a page break after a specific paragraph. Paragraph indices stay the same, except after the last paragraph, where an empty paragraph starts the new page.",
     {
       documentName: z.string().describe("Name of the open document"),
       afterParagraph: z.number().int().min(0).describe("Insert page break after this paragraph index (0-based)"),
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, afterParagraph }) => handleJXA(() => runJXA<string>(`
-      const app = Application("Pages");
-      const doc = app.documents.byName(params.documentName);
-      const paras = doc.bodyText.paragraphs;
-      const count = paras.length;
-      if (params.afterParagraph >= count) {
-        throw new Error("Paragraph index " + params.afterParagraph + " out of range (0-" + (count - 1) + ")");
+      ${BODY_EDIT_HELPERS}
+      const doc = openDoc(params.documentName);
+      const body = bodyChars(doc);
+      const paras = paraBounds(body);
+      if (params.afterParagraph >= paras.length) {
+        throw new Error("Paragraph index " + params.afterParagraph + " out of range (0-" + (paras.length - 1) + ")");
       }
 
-      // Save formatting on all paragraphs
-      const formats = [];
-      for (let i = 0; i < count; i++) {
-        try { formats.push({ font: paras[i].font(), size: paras[i].size(), color: paras[i].color() }); }
-        catch(e) { formats.push(null); }
-      }
+      // A form feed ends a paragraph with a page break. Replace the paragraph's separator
+      // with it; adding one before the "\\n" would leave an empty paragraph on the new page.
+      // The last paragraph has no separator, so the break goes after its last character
+      // and an empty paragraph starts the new page.
+      const p = paras[params.afterParagraph];
+      if (p.sep === "\\f") throw new Error("Paragraph " + params.afterParagraph + " is already followed by a page break");
+      if (p.sep) setChar(doc, p.end, "\\f");
+      else if (!body.length) setBody(doc, "\\f");
+      else setChar(doc, body.length - 1, editableChar(body, body.length - 1) + "\\f");
+      checkBody(doc);
 
-      // Insert form feed character at the end of the target paragraph's text.
-      // \f creates a visual page break in Pages.
-      const lines = doc.bodyText().split("\\n");
-      lines[params.afterParagraph] = lines[params.afterParagraph] + "\\f";
-      doc.bodyText = lines.join("\\n");
-
-      // Restore formatting — the \f creates one extra paragraph, so shift indices after the break
-      for (let i = 0; i < formats.length; i++) {
-        if (!formats[i]) continue;
-        const newIdx = i <= params.afterParagraph ? i : i + 1;
-        try {
-          const p = doc.bodyText.paragraphs[newIdx];
-          p.font = formats[i].font;
-          p.size = formats[i].size;
-          p.color = formats[i].color;
-        } catch(e) {}
-      }
-
-      return JSON.stringify({ pageBreakInserted: true, afterParagraph: params.afterParagraph });
+      return JSON.stringify({ pageBreakInserted: true, afterParagraph: params.afterParagraph, paragraphCount: doc.bodyText.paragraphs.length });
     `, { documentName, afterParagraph })),
   );
 
@@ -771,8 +859,8 @@ export function registerPagesTools(server: McpServer): void {
     "Create a Pages document with multiple formatted paragraphs in one call (much faster than adding paragraphs individually). For bold/italic, use PostScript font names like 'HelveticaNeue-Bold' or 'Georgia-Italic'.",
     {
       paragraphs: z.array(z.object({
-        text: z.string().describe("Paragraph text (no trailing newline needed)"),
-        fontSize: z.number().positive().optional().describe("Font size in points (default: 12)"),
+        text: z.string().describe("Paragraph text (no trailing newline needed; a newline inside it starts another paragraph with the same formatting)"),
+        fontSize: z.number().positive().optional().describe("Font size in points (default: the template's body size)"),
         fontName: z.string().optional().describe("PostScript font name, e.g. 'HelveticaNeue-Bold', 'Georgia-Italic'"),
         textColor: z.string().regex(/^#[0-9A-Fa-f]{6}$/).optional().describe("Text color as hex, e.g. '#FF0000'"),
       })).describe("Array of paragraphs with optional formatting"),
@@ -780,38 +868,57 @@ export function registerPagesTools(server: McpServer): void {
     },
     ANNOTATIONS.readWrite,
     async ({ paragraphs, filePath }) => handleJXA(() => runJXA<string>(`
+      ObjC.import("AppKit");
+      // A wrong font name fails halfway with an opaque -1700; check them before creating anything
+      const badFonts = [];
+      for (const p of params.paragraphs) {
+        if (p.fontName && $.NSFont.fontWithNameSize(p.fontName, 12).isNil() && badFonts.indexOf(p.fontName) < 0) badFonts.push(p.fontName);
+      }
+      if (badFonts.length) throw new Error("Unknown font name(s): " + badFonts.join(", ") + ". Use PostScript names like 'HelveticaNeue-Bold'.");
+
       const app = Application("Pages");
       let doc = app.Document();
       app.documents.push(doc);
-
-      // Build full text with newlines between paragraphs
-      let fullText = "";
-      for (let i = 0; i < params.paragraphs.length; i++) {
-        fullText += params.paragraphs[i].text + "\\n";
-      }
-      doc.bodyText = fullText;
-
-      // Format each paragraph via bodyText.paragraphs
-      // A single input paragraph with \\n creates multiple Pages paragraphs,
-      // so we track the real index offset and apply formatting to all sub-paragraphs.
-      let paraIdx = 0;
-      for (let i = 0; i < params.paragraphs.length; i++) {
-        const p = params.paragraphs[i];
-        const nlCount = (p.text.match(/\\n/g) || []).length;
-        let r, g, b;
-        if (p.textColor !== undefined) {
-          const hex = p.textColor;
-          r = parseInt(hex.slice(1, 3), 16) * 257;
-          g = parseInt(hex.slice(3, 5), 16) * 257;
-          b = parseInt(hex.slice(5, 7), 16) * 257;
+      try {
+        // Build full text with newlines between paragraphs
+        let fullText = "";
+        for (let i = 0; i < params.paragraphs.length; i++) {
+          fullText += params.paragraphs[i].text + "\\n";
         }
-        for (let j = 0; j <= nlCount; j++) {
-          const para = doc.bodyText.paragraphs[paraIdx + j];
-          if (p.fontSize !== undefined) para.size = p.fontSize;
-          if (p.fontName !== undefined) para.font = p.fontName;
-          if (r !== undefined) para.color = [r, g, b];
+        doc.bodyText = fullText;
+
+        // Format each paragraph via bodyText.paragraphs
+        // A single input paragraph with \\n creates multiple Pages paragraphs,
+        // so we track the real index offset and apply formatting to all sub-paragraphs.
+        let paraIdx = 0;
+        for (let i = 0; i < params.paragraphs.length; i++) {
+          const p = params.paragraphs[i];
+          const nlCount = (p.text.match(/\\n/g) || []).length;
+          let r, g, b;
+          if (p.textColor !== undefined) {
+            const hex = p.textColor;
+            r = parseInt(hex.slice(1, 3), 16) * 257;
+            g = parseInt(hex.slice(3, 5), 16) * 257;
+            b = parseInt(hex.slice(5, 7), 16) * 257;
+          }
+          for (let j = 0; j <= nlCount; j++) {
+            const para = doc.bodyText.paragraphs[paraIdx + j];
+            if (p.fontSize !== undefined) para.size = p.fontSize;
+            if (p.fontName !== undefined) para.font = p.fontName;
+            if (r !== undefined) para.color = [r, g, b];
+          }
+          paraIdx += nlCount + 1;
         }
-        paraIdx += nlCount + 1;
+      } catch (e) {
+        // Don't leave a half-filled untitled document (or its iCloud auto-save) behind
+        let autoSave = null;
+        try { autoSave = doc.file() ? doc.file().toString() : null; } catch (e2) {}
+        try { doc.close({ saving: "no" }); } catch (e2) {}
+        if (autoSave && autoSave.indexOf("/Library/Mobile Documents/") >= 0) {
+          delay(1);
+          $.NSFileManager.defaultManager.trashItemAtURLResultingItemURLError($.NSURL.fileURLWithPath(autoSave), null, null);
+        }
+        throw e;
       }
 
       if (params.filePath) {
@@ -835,7 +942,7 @@ export function registerPagesTools(server: McpServer): void {
     "Upscale an image in a document using AI Super Resolution (Creator Studio only). Increases resolution while preserving quality.",
     {
       documentName: z.string().describe("Name of the open document"),
-      imageIndex: z.number().int().min(1).describe("Image index (1-based) in the document"),
+      imageIndex: z.number().int().min(1).describe("Image index, 1-based (pages_list_images index + 1)"),
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, imageIndex }) => {
@@ -843,15 +950,14 @@ export function registerPagesTools(server: McpServer): void {
         return toolResult("Super Resolution requires Apple Creator Studio (iWork 15.1+).", true);
       }
       return handleJXA(async () => {
-        await runJXA<void>(`
-          const app = Application("Pages");
-          app.activate();
-          const doc = app.documents.byName(params.documentName);
+        const docName = await runJXA<string>(`
+          const doc = Application("Pages").documents.byName(params.documentName);
           const images = doc.images();
           if (params.imageIndex > images.length) throw new Error("Image index " + params.imageIndex + " out of range (document has " + images.length + " images)");
-          app.selection = [images[params.imageIndex - 1]];
+          return JSON.stringify(doc.name());
         `, { documentName, imageIndex },
-        { label: "super_resolution:select" });
+        { label: "super_resolution:check" });
+        await selectForMenu("Pages", docName, "image " + imageIndex);
 
         await clickMenuItem("Pages", ["Format", "Image", "Super Resolution"], { postdelay: 2 });
 
@@ -865,7 +971,7 @@ export function registerPagesTools(server: McpServer): void {
     "Remove the background from an image in a document using AI (Creator Studio only).",
     {
       documentName: z.string().describe("Name of the open document"),
-      imageIndex: z.number().int().min(1).describe("Image index (1-based) in the document"),
+      imageIndex: z.number().int().min(1).describe("Image index, 1-based (pages_list_images index + 1)"),
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, imageIndex }) => {
@@ -873,15 +979,14 @@ export function registerPagesTools(server: McpServer): void {
         return toolResult("Remove Background requires Apple Creator Studio (iWork 15.1+).", true);
       }
       return handleJXA(async () => {
-        await runJXA<void>(`
-          const app = Application("Pages");
-          app.activate();
-          const doc = app.documents.byName(params.documentName);
+        const docName = await runJXA<string>(`
+          const doc = Application("Pages").documents.byName(params.documentName);
           const images = doc.images();
           if (params.imageIndex > images.length) throw new Error("Image index " + params.imageIndex + " out of range (document has " + images.length + " images)");
-          app.selection = [images[params.imageIndex - 1]];
+          return JSON.stringify(doc.name());
         `, { documentName, imageIndex },
-        { label: "remove_background:select" });
+        { label: "remove_background:check" });
+        await selectForMenu("Pages", docName, "image " + imageIndex);
 
         await clickMenuItem("Pages", ["Format", "Image", "Remove Background"], { postdelay: 2 });
 
