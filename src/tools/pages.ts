@@ -506,10 +506,11 @@ export function registerPagesTools(server: McpServer): void {
 
   server.tool(
     "pages_format_text",
-    "Set formatting on a paragraph: font (PostScript name), size, color. For bold use a bold font name like 'HelveticaNeue-Bold', for italic use 'HelveticaNeue-Italic'.",
+    "Set formatting on a paragraph, or on part of it: font (PostScript name), size, color. For bold use a bold font name like 'HelveticaNeue-Bold', for italic use 'HelveticaNeue-Italic'. Pass text to format only the first occurrence of that text in the paragraph, e.g. a bold 'Figure 1:' at the start of a caption.",
     {
       documentName: z.string().describe("Name of the open document"),
       paragraphIndex: z.number().int().min(0).describe("Paragraph index (0-based)"),
+      text: z.string().min(1).optional().describe("Format only the first occurrence of this text in the paragraph (default: the whole paragraph)"),
       format: z.object({
         fontSize: z.number().positive().optional().describe("Font size in points"),
         fontName: z.string().optional().describe("PostScript font name (e.g. 'HelveticaNeue-Bold' for bold, 'Georgia-Italic' for italic)"),
@@ -517,28 +518,44 @@ export function registerPagesTools(server: McpServer): void {
       }).refine((f) => Object.values(f).some((v) => v !== undefined), "Set at least one of fontSize, fontName or textColor").describe("Formatting options"),
     },
     ANNOTATIONS.readWrite,
-    async ({ documentName, paragraphIndex, format }) => handleJXA(() => runJXA<string>(`
-      const app = Application("Pages");
-      const doc = app.documents.byName(params.documentName);
+    async ({ documentName, paragraphIndex, text, format }) => handleJXA(() => runJXA<string>(`
+      ${BODY_EDIT_HELPERS}
+      const doc = openDoc(params.documentName);
       const paraCount = doc.bodyText.paragraphs.length;
       if (params.paragraphIndex >= paraCount) {
         throw new Error("Paragraph index " + params.paragraphIndex + " out of range (0-" + (paraCount - 1) + ")");
       }
-      const paragraph = doc.bodyText.paragraphs[params.paragraphIndex];
       const fmt = params.format;
-
-      if (fmt.fontSize !== undefined) paragraph.size = fmt.fontSize;
-      if (fmt.fontName !== undefined) paragraph.font = fmt.fontName;
+      let color = null;
       if (fmt.textColor !== undefined) {
         const hex = fmt.textColor;
-        const r = parseInt(hex.slice(1, 3), 16) * 257;
-        const g = parseInt(hex.slice(3, 5), 16) * 257;
-        const b = parseInt(hex.slice(5, 7), 16) * 257;
-        paragraph.color = [r, g, b];
+        color = [parseInt(hex.slice(1, 3), 16) * 257, parseInt(hex.slice(3, 5), 16) * 257, parseInt(hex.slice(5, 7), 16) * 257];
       }
 
-      return JSON.stringify({ formatted: true, paragraphIndex: params.paragraphIndex });
-    `, { documentName, paragraphIndex, format })),
+      if (params.text === null) {
+        const paragraph = doc.bodyText.paragraphs[params.paragraphIndex];
+        if (fmt.fontSize !== undefined) paragraph.size = fmt.fontSize;
+        if (fmt.fontName !== undefined) paragraph.font = fmt.fontName;
+        if (color) paragraph.color = color;
+        return JSON.stringify({ formatted: true, paragraphIndex: params.paragraphIndex });
+      }
+
+      // Part of the paragraph: set the properties on a character range through AppleScript
+      const chars = bodyChars(doc);
+      const p = paraBounds(chars)[params.paragraphIndex];
+      const paraText = chars.slice(p.start, p.end).join("");
+      const idx = paraText.indexOf(params.text);
+      if (idx === -1) throw new Error(JSON.stringify(params.text) + " not found in paragraph " + params.paragraphIndex);
+      const from = p.start + Array.from(paraText.slice(0, idx)).length;
+      const range = "(" + charRange(doc, from, from + Array.from(params.text).length - 1) + ")";
+      const lines = [];
+      if (fmt.fontSize !== undefined) lines.push("set size of " + range + " to " + fmt.fontSize);
+      // A JSON string is a valid AppleScript string for a font name (no control characters)
+      if (fmt.fontName !== undefined) lines.push("set font of " + range + " to " + JSON.stringify(fmt.fontName));
+      if (color) lines.push("set color of " + range + " to {" + color.join(", ") + "}");
+      runAS('tell application "Pages"\\n' + lines.join("\\n") + "\\nend tell");
+      return JSON.stringify({ formatted: true, paragraphIndex: params.paragraphIndex, text: params.text });
+    `, { documentName, paragraphIndex, text: text ?? null, format })),
   );
 
   server.tool(
