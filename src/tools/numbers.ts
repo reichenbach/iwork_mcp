@@ -443,14 +443,15 @@ export function registerNumbersTools(server: McpServer): void {
 
   server.tool(
     "numbers_read_table",
-    "Read all data from a table as a 2D array. Returns rows of cell values.",
+    "Read all data from a table as a 2D array. Returns rows of cell values; empty rows/columns at the end are left out unless includeEmpty is set.",
     {
       documentName: z.string().describe("Name of the open document"),
       sheetName: z.string().optional().describe("Sheet name (defaults to first sheet)"),
       tableName: z.string().optional().describe("Table name (defaults to first table)"),
+      includeEmpty: z.boolean().optional().describe("Keep empty rows/columns at the end of the table (default: false)"),
     },
     ANNOTATIONS.readOnly,
-    async ({ documentName, sheetName, tableName }) => handleJXA(() => runJXA<string>(`
+    async ({ documentName, sheetName, tableName, includeEmpty }) => handleJXA(() => runJXA<string>(`
       const app = Application("Numbers");
       const doc = app.documents.byName(params.documentName);
       const sheet = params.sheetName ? doc.sheets.byName(params.sheetName) : doc.sheets[0];
@@ -459,12 +460,19 @@ export function registerNumbersTools(server: McpServer): void {
       const colCount = table.columnCount();
       // Batch read all cell values in one IPC call
       const allValues = table.cells.value();
-      const data = [];
+      let data = [];
       for (let r = 0; r < rowCount; r++) {
         data.push(allValues.slice(r * colCount, (r + 1) * colCount));
       }
+      if (!params.includeEmpty) {
+        const isEmpty = (v) => v === null || v === undefined || v === "";
+        while (data.length > 0 && data[data.length - 1].every(isEmpty)) data.pop();
+        let cols = colCount;
+        while (cols > 0 && data.every(row => isEmpty(row[cols - 1]))) cols--;
+        data = data.map(row => row.slice(0, cols));
+      }
       return JSON.stringify(data);
-    `, { documentName, sheetName: sheetName ?? null, tableName: tableName ?? null })),
+    `, { documentName, sheetName: sheetName ?? null, tableName: tableName ?? null, includeEmpty: includeEmpty ?? false })),
   );
 
   server.tool(
@@ -612,7 +620,7 @@ export function registerNumbersTools(server: McpServer): void {
 
   server.tool(
     "numbers_write_table",
-    "Bulk write an entire table of data in a single operation. Much faster than writing cells individually. Resizes the table to fit the data automatically.",
+    "Bulk write an entire table of data in a single operation. Much faster than writing cells individually. Resizes the table to fit the data automatically, including removing empty rows/columns past the data.",
     {
       documentName: z.string().describe("Name of the open document"),
       data: z.array(z.array(z.union([z.string(), z.number(), z.boolean(), z.null()]))).min(1)
@@ -620,7 +628,7 @@ export function registerNumbersTools(server: McpServer): void {
       startCell: z.string().regex(/^[A-Z]{1,3}\d+$/).optional().describe("Top-left cell to start writing from (default: 'A1')"),
       sheetName: z.string().optional().describe("Sheet name (defaults to first sheet)"),
       tableName: z.string().optional().describe("Table name (defaults to first table)"),
-      resizeToFit: z.boolean().optional().describe("Resize table to fit data (default: true)"),
+      resizeToFit: z.boolean().optional().describe("Resize table to fit data: add missing rows/columns and remove empty ones past the data (default: true)"),
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, data, startCell, sheetName, tableName, resizeToFit }) => handleJXA(() => runJXA<string>(`
@@ -668,7 +676,21 @@ export function registerNumbersTools(server: McpServer): void {
           }
         }
       }
-      return JSON.stringify({ cellsWritten: cellsWritten, rows: dataRows, columns: dataCols });
+
+      // Also drop trailing rows/columns past the data if they are empty (e.g. the 22x7 default table)
+      if (params.resizeToFit !== false) {
+        const values = table.cells.value();
+        const cols = table.columnCount();
+        const isEmpty = (v) => v === null || v === undefined || v === "";
+        const rowEmpty = (r) => { for (let c = 0; c < cols; c++) if (!isEmpty(values[r * cols + c])) return false; return true; };
+        const colEmpty = (c, rows) => { for (let r = 0; r < rows; r++) if (!isEmpty(values[r * cols + c])) return false; return true; };
+        try {
+          for (let r = table.rowCount() - 1; r >= Math.max(needRows, 2) && rowEmpty(r); r--) app.delete(table.rows[r]);
+          const rows = table.rowCount();
+          for (let c = table.columnCount() - 1; c >= Math.max(needCols, 2) && colEmpty(c, rows); c--) app.delete(table.columns[c]);
+        } catch (e) {}
+      }
+      return JSON.stringify({ cellsWritten: cellsWritten, rows: dataRows, columns: dataCols, tableRows: table.rowCount(), tableColumns: table.columnCount() });
     `, { documentName, data, startCell: startCell ?? null, sheetName: sheetName ?? null, tableName: tableName ?? null, resizeToFit: resizeToFit ?? true })),
   );
 
