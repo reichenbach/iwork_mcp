@@ -35,6 +35,86 @@ async function handleJXA<T>(fn: () => Promise<T>): Promise<{ content: { type: "t
 }
 
 export function registerPagesTools(server: McpServer): void {
+  // The text tools edit the body in place. Setting doc.bodyText (or a whole paragraph)
+  // resets the formatting of everything it covers, character styles and paragraph
+  // styles alike, and deletes the inline images and tables anchored there (U+FFFC in
+  // the text). Setting one character to a string replaces just that character, and the
+  // new text takes its formatting; deleting a character range leaves the rest alone.
+  // Pages counts characters in code points, so positions index Array.from(bodyText),
+  // not the UTF-16 string (an emoji is one character to Pages, two string units to JS).
+  // Pages ends a paragraph at "\\n" and at a page break ("\\f").
+  const BODY_EDIT_HELPERS = `
+    ObjC.import("Foundation");
+    const OBJECT_CHAR = "\\uFFFC";
+    function openDoc(name) {
+      // By id: Creator Studio's auto-save renames the document after an edit
+      const app = Application("Pages");
+      return app.documents.byId(app.documents.byName(name).id());
+    }
+    // The body as an array of characters, indexed like doc.bodyText.characters. The edit
+    // functions below keep a copy of what the body should become, for checkBody.
+    let expectedBody = null;
+    function bodyChars(doc) {
+      const chars = Array.from(doc.bodyText());
+      expectedBody = chars.slice();
+      return chars;
+    }
+    function setBody(doc, s) {
+      doc.bodyText = s;
+      expectedBody = Array.from(s);
+    }
+    // Pages sometimes ignores a scripted text change without an error (seen while the
+    // document's window was in the middle of an edit), so compare the body with what the
+    // edits should have produced instead of reporting success regardless.
+    function checkBody(doc) {
+      if (doc.bodyText() !== expectedBody.join("")) {
+        throw new Error("Pages did not apply the change to the body text. Its window may be in the middle of an edit: click into the document, or close and reopen it, and try again.");
+      }
+    }
+    // One entry per paragraph, matching doc.bodyText.paragraphs: its characters are
+    // text.slice(start, end), and sep ("\\n", "\\f" or "" for the last) sits at end.
+    function paraBounds(text) {
+      const paras = [];
+      let start = 0;
+      for (let i = 0; i < text.length; i++) {
+        if (text[i] === "\\n" || text[i] === "\\f") {
+          paras.push({ start: start, end: i, sep: text[i] });
+          start = i + 1;
+        }
+      }
+      paras.push({ start: start, end: text.length, sep: "" });
+      return paras;
+    }
+    function setChar(doc, index, s) {
+      doc.bodyText.characters[index] = s;
+      Array.prototype.splice.apply(expectedBody, [index, 1].concat(Array.from(s)));
+    }
+    // A character next to which text goes in. An inline object can't be the one: setting
+    // it to a string deletes the object.
+    function editableChar(body, index) {
+      if (body[index] === OBJECT_CHAR) {
+        throw new Error("Can't add text here without removing the inline image or table next to it. Insert the text at another paragraph.");
+      }
+      return body[index];
+    }
+    function runAS(src) {
+      const err = $();
+      const result = $.NSAppleScript.alloc.initWithSource(src).executeAndReturnError(err);
+      if (!result || (result.isNil && result.isNil())) {
+        const info = ObjC.deepUnwrap(err) || {};
+        throw new Error(info.NSAppleScriptErrorBriefMessage || info.NSAppleScriptErrorMessage || "AppleScript execution failed");
+      }
+      return result;
+    }
+    function charRange(doc, from, to) {  // 0-based, inclusive
+      return "characters " + (from + 1) + " thru " + (to + 1) + ' of body text of document id "' + doc.id() + '"';
+    }
+    function deleteChars(doc, from, to) {
+      if (to < from) return;
+      runAS('tell application "Pages" to delete (' + charRange(doc, from, to) + ")");
+      expectedBody.splice(from, to - from + 1);
+    }
+  `;
   // ── Document Management ──
 
   server.tool(
@@ -313,119 +393,80 @@ export function registerPagesTools(server: McpServer): void {
 
   server.tool(
     "pages_add_text",
-    "Append text to the end of the document body (preserves existing formatting). Include a trailing newline to start a new paragraph.",
+    "Append text to the end of the document body. It takes the formatting of the text it follows; existing text, images and tables are left as they are. Include a trailing newline to start a new paragraph.",
     {
       documentName: z.string().describe("Name of the open document"),
       text: z.string().describe("Text to append (include trailing newline for a new paragraph)"),
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, text }) => handleJXA(() => runJXA<string>(`
-      const app = Application("Pages");
-      const doc = app.documents.byName(params.documentName);
-      // Save formatting on all existing paragraphs
-      const paras = doc.bodyText.paragraphs;
-      const count = paras.length;
-      const formats = [];
-      for (let i = 0; i < count; i++) {
-        try { formats.push({ font: paras[i].font(), size: paras[i].size(), color: paras[i].color() }); }
-        catch(e) { formats.push(null); }
-      }
-      // Append
-      doc.bodyText = doc.bodyText() + params.text;
-      // Restore formatting on pre-existing paragraphs
-      for (let i = 0; i < formats.length; i++) {
-        if (!formats[i]) continue;
-        try {
-          const p = doc.bodyText.paragraphs[i];
-          p.font = formats[i].font;
-          p.size = formats[i].size;
-          p.color = formats[i].color;
-        } catch(e) {}
-      }
+      ${BODY_EDIT_HELPERS}
+      const doc = openDoc(params.documentName);
+      const body = bodyChars(doc);
+      if (!body.length) setBody(doc, params.text);
+      else if (params.text) setChar(doc, body.length - 1, editableChar(body, body.length - 1) + params.text);
+      checkBody(doc);
       return JSON.stringify({ appended: true, paragraphCount: doc.bodyText.paragraphs.length });
     `, { documentName, text })),
   );
 
   server.tool(
     "pages_insert_text_at",
-    "Insert text at a specific paragraph index (preserves formatting on other paragraphs)",
+    "Insert text as new paragraphs after a paragraph. The new paragraphs get the character and paragraph formatting of the paragraph before them (of paragraph 0 when inserting at the beginning); other text, images and tables are left as they are.",
     {
       documentName: z.string().describe("Name of the open document"),
-      text: z.string().describe("Text to insert (include trailing newline)"),
+      text: z.string().describe("Text to insert; newlines separate paragraphs (a trailing newline is ignored)"),
       afterParagraph: z.number().int().min(-1).describe("Insert after this paragraph index (0-based). Use -1 to insert at the beginning."),
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, text, afterParagraph }) => handleJXA(() => runJXA<string>(`
-      const app = Application("Pages");
-      const doc = app.documents.byName(params.documentName);
-      // Save formatting
-      const paras = doc.bodyText.paragraphs;
-      const count = paras.length;
-      const formats = [];
-      for (let i = 0; i < count; i++) {
-        try { formats.push({ font: paras[i].font(), size: paras[i].size(), color: paras[i].color() }); }
-        catch(e) { formats.push(null); }
+      ${BODY_EDIT_HELPERS}
+      const doc = openDoc(params.documentName);
+      const body = bodyChars(doc);
+      const paras = paraBounds(body);
+      if (params.afterParagraph >= paras.length) {
+        throw new Error("Paragraph index " + params.afterParagraph + " out of range (0-" + (paras.length - 1) + ")");
       }
-      // Insert via string manipulation
-      const bt = doc.bodyText();
-      const lines = bt.split("\\n");
-      const insertIdx = params.afterParagraph < 0 ? 0 : params.afterParagraph + 1;
       const newText = params.text.endsWith("\\n") ? params.text.slice(0, -1) : params.text;
-      const nlCount = (newText.match(/\\n/g) || []).length;
-      lines.splice(insertIdx, 0, newText);
-      doc.bodyText = lines.join("\\n");
-      // Restore formatting (shift indices after insert point by number of new paragraphs)
-      for (let i = 0; i < formats.length; i++) {
-        if (!formats[i]) continue;
-        const newIdx = i < insertIdx ? i : i + nlCount + 1;
-        try {
-          const p = doc.bodyText.paragraphs[newIdx];
-          p.font = formats[i].font;
-          p.size = formats[i].size;
-          p.color = formats[i].color;
-        } catch(e) {}
+      if (!body.length) {
+        setBody(doc, params.afterParagraph < 0 ? newText + "\\n" : "\\n" + newText);
+      } else if (params.afterParagraph < 0) {
+        setChar(doc, 0, newText + "\\n" + editableChar(body, 0));
+      } else {
+        const p = paras[params.afterParagraph];
+        // Replace the paragraph's separator with itself plus the new paragraphs; after the
+        // last paragraph, which has none, extend its last character instead.
+        if (p.sep) setChar(doc, p.end, p.sep + newText + "\\n");
+        else setChar(doc, body.length - 1, editableChar(body, body.length - 1) + "\\n" + newText);
       }
+      checkBody(doc);
       return JSON.stringify({ inserted: true, paragraphCount: doc.bodyText.paragraphs.length });
     `, { documentName, text, afterParagraph })),
   );
 
   server.tool(
     "pages_delete_text",
-    "Delete a paragraph by index (preserves formatting on other paragraphs)",
+    "Delete a paragraph by index, with any inline images or tables in it. Other paragraphs keep their text and formatting.",
     {
       documentName: z.string().describe("Name of the open document"),
       paragraphIndex: z.number().int().min(0).describe("Paragraph index to delete (0-based)"),
     },
     ANNOTATIONS.destructive,
     async ({ documentName, paragraphIndex }) => handleJXA(() => runJXA<string>(`
-      const app = Application("Pages");
-      const doc = app.documents.byName(params.documentName);
-      // Save formatting
-      const paras = doc.bodyText.paragraphs;
-      const count = paras.length;
-      const formats = [];
-      for (let i = 0; i < count; i++) {
-        try { formats.push({ font: paras[i].font(), size: paras[i].size(), color: paras[i].color() }); }
-        catch(e) { formats.push(null); }
+      ${BODY_EDIT_HELPERS}
+      const doc = openDoc(params.documentName);
+      const paras = paraBounds(bodyChars(doc));
+      const i = params.paragraphIndex;
+      if (i < 0 || i >= paras.length) {
+        throw new Error("Paragraph index " + i + " out of range (0-" + (paras.length - 1) + ")");
       }
-      // Delete via string manipulation
-      const lines = doc.bodyText().split("\\n");
-      if (params.paragraphIndex < 0 || params.paragraphIndex >= lines.length) {
-        throw new Error("Paragraph index " + params.paragraphIndex + " out of range (0-" + (lines.length - 1) + ")");
-      }
-      lines.splice(params.paragraphIndex, 1);
-      formats.splice(params.paragraphIndex, 1);
-      doc.bodyText = lines.join("\\n");
-      // Restore formatting
-      for (let i = 0; i < formats.length; i++) {
-        if (!formats[i]) continue;
-        try {
-          const p = doc.bodyText.paragraphs[i];
-          p.font = formats[i].font;
-          p.size = formats[i].size;
-          p.color = formats[i].color;
-        } catch(e) {}
-      }
+      const p = paras[i];
+      if (paras.length === 1) deleteChars(doc, p.start, p.end - 1);
+      // The last paragraph, or one that ends with a page break: delete it together with the
+      // separator before it, so the paragraph before ends the body or takes over the break.
+      else if (i > 0 && p.sep !== "\\n") deleteChars(doc, paras[i - 1].end, p.end - 1);
+      else deleteChars(doc, p.start, p.end);
+      checkBody(doc);
       return JSON.stringify({ deleted: true, paragraphCount: doc.bodyText.paragraphs.length });
     `, { documentName, paragraphIndex })),
   );
@@ -749,47 +790,33 @@ export function registerPagesTools(server: McpServer): void {
 
   server.tool(
     "pages_insert_page_break",
-    "Insert a page break after a specific paragraph. Creates a visual page break in the document.",
+    "Insert a page break after a specific paragraph. Paragraph indices stay the same, except after the last paragraph, where an empty paragraph starts the new page.",
     {
       documentName: z.string().describe("Name of the open document"),
       afterParagraph: z.number().int().min(0).describe("Insert page break after this paragraph index (0-based)"),
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, afterParagraph }) => handleJXA(() => runJXA<string>(`
-      const app = Application("Pages");
-      const doc = app.documents.byName(params.documentName);
-      const paras = doc.bodyText.paragraphs;
-      const count = paras.length;
-      if (params.afterParagraph >= count) {
-        throw new Error("Paragraph index " + params.afterParagraph + " out of range (0-" + (count - 1) + ")");
+      ${BODY_EDIT_HELPERS}
+      const doc = openDoc(params.documentName);
+      const body = bodyChars(doc);
+      const paras = paraBounds(body);
+      if (params.afterParagraph >= paras.length) {
+        throw new Error("Paragraph index " + params.afterParagraph + " out of range (0-" + (paras.length - 1) + ")");
       }
 
-      // Save formatting on all paragraphs
-      const formats = [];
-      for (let i = 0; i < count; i++) {
-        try { formats.push({ font: paras[i].font(), size: paras[i].size(), color: paras[i].color() }); }
-        catch(e) { formats.push(null); }
-      }
+      // A form feed ends a paragraph with a page break. Replace the paragraph's separator
+      // with it; adding one before the "\\n" would leave an empty paragraph on the new page.
+      // The last paragraph has no separator, so the break goes after its last character
+      // and an empty paragraph starts the new page.
+      const p = paras[params.afterParagraph];
+      if (p.sep === "\\f") throw new Error("Paragraph " + params.afterParagraph + " is already followed by a page break");
+      if (p.sep) setChar(doc, p.end, "\\f");
+      else if (!body.length) setBody(doc, "\\f");
+      else setChar(doc, body.length - 1, editableChar(body, body.length - 1) + "\\f");
+      checkBody(doc);
 
-      // Insert form feed character at the end of the target paragraph's text.
-      // \f creates a visual page break in Pages.
-      const lines = doc.bodyText().split("\\n");
-      lines[params.afterParagraph] = lines[params.afterParagraph] + "\\f";
-      doc.bodyText = lines.join("\\n");
-
-      // Restore formatting — the \f creates one extra paragraph, so shift indices after the break
-      for (let i = 0; i < formats.length; i++) {
-        if (!formats[i]) continue;
-        const newIdx = i <= params.afterParagraph ? i : i + 1;
-        try {
-          const p = doc.bodyText.paragraphs[newIdx];
-          p.font = formats[i].font;
-          p.size = formats[i].size;
-          p.color = formats[i].color;
-        } catch(e) {}
-      }
-
-      return JSON.stringify({ pageBreakInserted: true, afterParagraph: params.afterParagraph });
+      return JSON.stringify({ pageBreakInserted: true, afterParagraph: params.afterParagraph, paragraphCount: doc.bodyText.paragraphs.length });
     `, { documentName, afterParagraph })),
   );
 
