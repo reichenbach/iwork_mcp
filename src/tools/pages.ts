@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioExportPDF, saveTimeout, clickMenuItem, resolveAppName, pagesInsertTableViaUI } from "../jxa.js";
+import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioPagesExportPDF, saveTimeout, clickMenuItem, resolveAppName, pagesInsertTableViaUI } from "../jxa.js";
 import { ANNOTATIONS } from "../annotations.js";
 
 function toolResult(text: string, isError = false) {
@@ -140,8 +140,11 @@ export function registerPagesTools(server: McpServer): void {
     ANNOTATIONS.readWrite,
     async ({ documentName, filePath, format }) => handleJXA(async () => {
       if (isCreatorStudio() && format === "PDF") {
-        await creatorStudioExportPDF("Pages", documentName, filePath);
-        return JSON.stringify({ exported: true, path: filePath, format: "PDF" });
+        const { method, pageCount, documentPageCount } = await creatorStudioPagesExportPDF(documentName, filePath);
+        const result: Record<string, unknown> = { exported: true, path: filePath, format: "PDF", method, pageCount };
+        if (method === "Quick Look") result.note = "Exported from the last saved state of the document";
+        if (pageCount === null || documentPageCount === null) result.warning = "Could not check the page count of the exported PDF";
+        return JSON.stringify(result);
       }
       return runJXA<string>(`
       const app = Application("Pages");

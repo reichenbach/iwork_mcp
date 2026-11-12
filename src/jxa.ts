@@ -399,7 +399,7 @@ export async function creatorStudioExportPDF(
       if (f) return f.toString();
       delay(1);
     }
-    throw new Error("Timed out waiting for document auto-save path");
+    throw new Error("The document has no file on disk yet, and this PDF export works from the saved file. Save it with a file path first.");
     `,
     { documentName },
     { timeout: 20_000, label: "creatorStudioExportPDF:getFile" },
@@ -412,17 +412,90 @@ export async function creatorStudioExportPDF(
       timeout: 30_000,
     });
 
-    // Find the generated PDF
+    // The preview can hold several PDF attachments (Attachment1.pdf, Attachment2.pdf, ...)
     const { stdout } = await execFileAsync("/usr/bin/find", [tmpDir, "-name", "*.pdf", "-type", "f"]);
-    const pdfPath = stdout.trim().split("\n")[0];
-    if (!pdfPath) {
+    const pdfs = stdout.split("\n").filter(Boolean).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    if (pdfs.length === 0) {
       throw new Error("Quick Look did not generate a PDF preview for this document");
     }
-
-    await copyFile(pdfPath, targetPath);
+    if (pdfs.length === 1) {
+      await copyFile(pdfs[0], targetPath);
+      return;
+    }
+    await runJXA<void>(
+      `
+      ObjC.import("Quartz");
+      const out = $.PDFDocument.alloc.init;
+      for (const path of params.pdfs) {
+        const part = $.PDFDocument.alloc.initWithURL($.NSURL.fileURLWithPath(path));
+        if (!part || part.isNil()) throw new Error("Could not read " + path);
+        for (let i = 0; i < Number(part.pageCount); i++) out.insertPageAtIndex(part.pageAtIndex(i), Number(out.pageCount));
+      }
+      if (!out.writeToFile(params.targetPath)) throw new Error("Could not write PDF to " + params.targetPath);
+      `,
+      { pdfs, targetPath },
+      { timeout: 60_000, label: "creatorStudioExportPDF:merge" },
+    );
   } finally {
     await rm(tmpDir, { recursive: true, force: true });
   }
+}
+
+async function pdfPageCount(path: string): Promise<number | null> {
+  return runJXA<number | null>(
+    `
+    ObjC.import("Quartz");
+    const pdf = $.PDFDocument.alloc.initWithURL($.NSURL.fileURLWithPath(params.path));
+    return JSON.stringify(pdf && !pdf.isNil() ? Number(pdf.pageCount) : null);
+    `,
+    { path },
+    { timeout: 20_000, label: "pdfPageCount" },
+  );
+}
+
+/**
+ * Creator Studio PDF export for Pages. Quick Look may render only the first page,
+ * so try the native export first and compare the PDF's page count with the document's.
+ */
+export async function creatorStudioPagesExportPDF(
+  documentName: string,
+  targetPath: string,
+): Promise<{ method: "native" | "Quick Look"; pageCount: number | null; documentPageCount: number | null }> {
+  const documentPageCount = await runJXA<number | null>(
+    `
+    const doc = Application("Pages").documents.byName(params.documentName);
+    try { return JSON.stringify(doc.pages.length); } catch (e) { return JSON.stringify(null); }
+    `,
+    { documentName },
+    { timeout: 20_000, label: "creatorStudioPagesExportPDF:pages" },
+  );
+
+  const mtimeBefore = existsSync(targetPath) ? (await stat(targetPath)).mtimeMs : -1;
+  let method: "native" | "Quick Look" = "native";
+  try {
+    await runJXA<void>(
+      `
+      const app = Application("Pages");
+      app.export(app.documents.byName(params.documentName), { to: Path(params.targetPath), as: "PDF" });
+      `,
+      { documentName, targetPath },
+      { timeout: 60_000, label: "creatorStudioPagesExportPDF:native" },
+    );
+  } catch {}
+  if (!existsSync(targetPath) || (await stat(targetPath)).mtimeMs <= mtimeBefore) {
+    method = "Quick Look";
+    await creatorStudioExportPDF("Pages", documentName, targetPath);
+  }
+
+  const pageCount = await pdfPageCount(targetPath);
+  if (pageCount !== null && documentPageCount !== null && pageCount < documentPageCount) {
+    await rm(targetPath, { force: true });
+    throw new Error(
+      `PDF export is incomplete: ${method} produced ${pageCount} of ${documentPageCount} pages, so the file was not kept. ` +
+        "Export the PDF from Pages by hand (File > Export To > PDF).",
+    );
+  }
+  return { method, pageCount, documentPageCount };
 }
 
 /**
