@@ -721,7 +721,7 @@ export function registerPagesTools(server: McpServer): void {
 
   server.tool(
     "pages_write_table_cells",
-    "Write values into table cells in a Pages document (1-based row/column). Strings starting with '=' become formulas (e.g. '=SUM(D2:D5)'). Existing formulas in other cells recalculate automatically. By default the table grows to fit out-of-range writes.",
+    "Write values into table cells in a Pages document (1-based row/column). Strings starting with '=' become formulas (e.g. '=SUM(D2:D5)'); formulas read back with the app's localized function names. Strings that would lose digits as numbers (e.g. '0049') are stored as text; booleans are written as =TRUE()/=FALSE() so they read back as true/false. Existing formulas in other cells recalculate automatically. By default the table grows to fit out-of-range writes.",
     {
       documentName: z.string().describe("Name of the open document"),
       tableIndex: z.number().int().min(1).optional().describe("Table index, 1-based (default: 1)"),
@@ -746,7 +746,19 @@ export function registerPagesTools(server: McpServer): void {
         body += 'if column count < ' + maxCol + ' then set column count to ' + maxCol + '\\n';
       }
       for (const c of params.cells) {
-        body += 'set value of cell ' + c.column + ' of row ' + c.row + ' to ' + asValue(c.value) + '\\n';
+        const cellAS = 'cell ' + c.column + ' of row ' + c.row;
+        // Keep strings like "0049" or "1.50" as text instead of numbers. Booleans would be stored
+        // as 1/0 (Pages can't set the checkbox format by script), but TRUE()/FALSE() keep the type.
+        const v = c.value;
+        const lossy = typeof v === "string" && v.trim() !== "" && v[0] !== "=" && !isNaN(Number(v)) && String(Number(v)) !== v;
+        // A cell holding a boolean coerces whatever is written next (7 or "0049" -> true) and
+        // refuses the text format; emptying it first resets the type, the format stays
+        if (v !== null) body += 'set value of ' + cellAS + ' to ""\\n';
+        if (lossy) body += 'try\\nset format of ' + cellAS + ' to text\\nend try\\n';
+        // In a text-formatted cell a formula would be stored as plain text
+        if (typeof v === "boolean" || (typeof v === "string" && v[0] === "=")) body += 'try\\nset format of ' + cellAS + ' to automatic\\nend try\\n';
+        const asV = typeof v === "boolean" ? asQuote(v ? "=TRUE()" : "=FALSE()") : asValue(v);
+        body += 'set value of ' + cellAS + ' to ' + asV + '\\n';
       }
       const src = 'tell application "Pages"\\n' +
         'tell ' + tableRef() + '\\n' +
