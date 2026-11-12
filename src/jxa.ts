@@ -243,6 +243,20 @@ async function writtenSince(path: string, sinceMs: number): Promise<string | nul
   }
 }
 
+/**
+ * Whether a document file is an untitled draft: auto-saved by the app (iCloud, Creator Studio)
+ * but never saved by the user. AppKit marks those with the com.apple.document.draft attribute
+ * and removes it on the first real save. A plain save of a draft opens a Save sheet and blocks.
+ */
+export async function isDraftFile(path: string): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync("/usr/bin/xattr", [path], { timeout: 5_000 });
+    return stdout.split("\n").some((name) => name.startsWith("com.apple.document.draft"));
+  } catch {
+    return false;
+  }
+}
+
 // Documents this server created that haven't been saved to a user path yet
 const createdDocuments = new Set<string>();
 

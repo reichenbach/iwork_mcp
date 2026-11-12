@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioPagesExportPDF, saveTimeout, clickMenuItem, resolveAppName, pagesInsertTableViaUI } from "../jxa.js";
+import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioPagesExportPDF, saveTimeout, clickMenuItem, resolveAppName, pagesInsertTableViaUI, isDraftFile } from "../jxa.js";
 import { ANNOTATIONS } from "../annotations.js";
 
 function toolResult(text: string, isError = false) {
@@ -83,16 +83,23 @@ export function registerPagesTools(server: McpServer): void {
 
   server.tool(
     "pages_open_document",
-    "Open a .pages file from disk",
+    "Open a document from disk: .pages, or Word, RTF and plain text files (imported as a new, unsaved document)",
     {
-      filePath: z.string().startsWith("/").describe("Absolute path to the .pages file"),
+      filePath: z.string().startsWith("/").describe("Absolute path to the file"),
     },
     ANNOTATIONS.readWrite,
-    async ({ filePath }) => handleJXA(() => runJXA<string>(`
+    async ({ filePath }) => handleJXA(async () => {
+      // Pages shows a modal alert for missing or unsupported files, which blocks every later call
+      if (!existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
+      if (!/\.(pages|docx?|dotx|rtfd?|txt|md|markdown)$/i.test(filePath)) {
+        throw new Error(`Pages can't open this file type: ${filePath}`);
+      }
+      return runJXA<string>(`
       const app = Application("Pages");
       const doc = app.open(Path(params.filePath));
       return JSON.stringify({ name: doc.name() });
-    `, { filePath })),
+    `, { filePath });
+    }),
   );
 
   server.tool(
@@ -104,6 +111,16 @@ export function registerPagesTools(server: McpServer): void {
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, filePath }) => handleJXA(async () => {
+      if (!filePath) {
+        // New and imported documents only have an auto-saved draft; saving one opens a Save sheet that blocks
+        const file = await runJXA<string | null>(`
+      const f = Application("Pages").documents.byName(params.documentName).file();
+      return JSON.stringify(f ? f.toString() : null);
+    `, { documentName });
+        if (!file || await isDraftFile(file)) {
+          throw new Error("The document has never been saved (it is new or was imported from another format); pass filePath to choose where to save it");
+        }
+      }
       if (isCreatorStudio()) {
         if (filePath) {
           const { name, reopened } = await creatorStudioSaveAs("Pages", documentName, filePath);
@@ -111,7 +128,12 @@ export function registerPagesTools(server: McpServer): void {
             ? { saved: true, name }
             : { saved: true, name, reopened: false, note: `Saved, but Pages did not reopen the file; open it with pages_open_document if needed.` });
         }
-        return JSON.stringify({ saved: true, name: documentName });
+        return runJXA<string>(`
+      ${PAGES_TABLE_HELPERS}
+      const doc = Application("Pages").documents.byName(params.documentName);
+      runAS('tell application "Pages" to save ' + docRef());
+      return JSON.stringify({ saved: true, name: doc.name() });
+    `, { documentName }, { timeout: saveTimeout(), label: "pages:save" });
       }
       return runJXA<string>(`
       const app = Application("Pages");
@@ -139,6 +161,10 @@ export function registerPagesTools(server: McpServer): void {
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, filePath, format }) => handleJXA(async () => {
+      const ext = { PDF: [".pdf"], Word: [".docx"], EPUB: [".epub"], Text: [".txt"] }[format];
+      if (!ext.some((e) => filePath.toLowerCase().endsWith(e))) {
+        throw new Error(`filePath must end in ${ext.join(" or ")} for ${format} export`);
+      }
       if (isCreatorStudio() && format === "PDF") {
         const { method, pageCount, documentPageCount } = await creatorStudioPagesExportPDF(documentName, filePath);
         const result: Record<string, unknown> = { exported: true, path: filePath, format: "PDF", method, pageCount };
