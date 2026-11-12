@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioKeynoteExportPDF, rememberCreatedDocument, untitledAutoSavePath, trashUntitledAutoSave, saveTimeout, clickMenuItem, resolveAppName } from "../jxa.js";
+import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioKeynoteExportPDF, rememberCreatedDocument, untitledAutoSavePath, trashUntitledAutoSave, saveTimeout, clickMenuItem, resolveAppName, selectForMenu } from "../jxa.js";
 import { ANNOTATIONS } from "../annotations.js";
 
 const execFileAsync = promisify(execFile);
@@ -2003,17 +2003,15 @@ export function registerKeynoteTools(server: McpServer): void {
         return toolResult("Super Resolution requires Apple Creator Studio (iWork 15.1+).", true);
       }
       return handleJXA(async () => {
-        await runJXA<void>(`
-          const app = Application("Keynote");
-          app.activate();
-          const doc = app.documents.byName(params.documentName);
-          doc.currentSlide = doc.slides[params.slideIndex - 1];
-          const slide = doc.slides[params.slideIndex - 1];
-          const images = slide.images();
+        const docName = await runJXA<string>(`
+          const doc = Application("Keynote").documents.byName(params.documentName);
+          if (params.slideIndex > doc.slides.length) throw new Error("Slide " + params.slideIndex + " out of range (presentation has " + doc.slides.length + " slides)");
+          const images = doc.slides[params.slideIndex - 1].images();
           if (params.imageIndex > images.length) throw new Error("Image index " + params.imageIndex + " out of range (slide has " + images.length + " images)");
-          app.selection = [images[params.imageIndex - 1]];
+          return JSON.stringify(doc.name());
         `, { documentName, slideIndex, imageIndex },
-        { label: "super_resolution:select" });
+        { label: "super_resolution:check" });
+        await selectForMenu("Keynote", docName, "image " + imageIndex + " of slide " + slideIndex, "set current slide of d to slide " + slideIndex + " of d");
 
         await clickMenuItem("Keynote", ["Format", "Image", "Super Resolution"], { postdelay: 2 });
 
@@ -2036,17 +2034,15 @@ export function registerKeynoteTools(server: McpServer): void {
         return toolResult("Remove Background requires Apple Creator Studio (iWork 15.1+).", true);
       }
       return handleJXA(async () => {
-        await runJXA<void>(`
-          const app = Application("Keynote");
-          app.activate();
-          const doc = app.documents.byName(params.documentName);
-          doc.currentSlide = doc.slides[params.slideIndex - 1];
-          const slide = doc.slides[params.slideIndex - 1];
-          const images = slide.images();
+        const docName = await runJXA<string>(`
+          const doc = Application("Keynote").documents.byName(params.documentName);
+          if (params.slideIndex > doc.slides.length) throw new Error("Slide " + params.slideIndex + " out of range (presentation has " + doc.slides.length + " slides)");
+          const images = doc.slides[params.slideIndex - 1].images();
           if (params.imageIndex > images.length) throw new Error("Image index " + params.imageIndex + " out of range (slide has " + images.length + " images)");
-          app.selection = [images[params.imageIndex - 1]];
+          return JSON.stringify(doc.name());
         `, { documentName, slideIndex, imageIndex },
-        { label: "remove_background:select" });
+        { label: "remove_background:check" });
+        await selectForMenu("Keynote", docName, "image " + imageIndex + " of slide " + slideIndex, "set current slide of d to slide " + slideIndex + " of d");
 
         await clickMenuItem("Keynote", ["Format", "Image", "Remove Background"], { postdelay: 2 });
 

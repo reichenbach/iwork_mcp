@@ -198,7 +198,8 @@ export function menuItemRef(path: string[]): string {
  * e.g. ["Table", "Magic Fill Cells"] or ["Format", "Image", "Super Resolution"].
  * Submenu items are clicked in two steps (open the parent, then the item): a direct
  * click on a third-level item silently does nothing. A disabled item is an error,
- * checked before any menu opens.
+ * checked before any menu opens. If the click opens a sheet in the front window (for
+ * example a subscription prompt), the sheet is cancelled and its text becomes the error.
  */
 export async function clickMenuItem(
   app: IWorkApp,
@@ -212,27 +213,56 @@ export async function clickMenuItem(
   for (let attempt = 0; ; attempt++) {
     const path = await resolveMenuPath(app, menuPath);
     const leaf = menuItemRef(path);
+    // A sheet that opens instead (e.g. "Subscribe to Apple Creator Studio" for the AI image
+    // tools) blocks every later call: cancel it and report its text.
     const script = `
     tell application "${resolveAppName(app)}" to activate
     delay ${predelay}
     tell application "System Events"
       tell process "${processName(app)}"
         if not (enabled of ${leaf}) then error "DISABLED"
+        set w to missing value
+        set sheetsBefore to 0
+        try
+          set w to window 1
+          set sheetsBefore to count of sheets of w
+        end try
         ${path.length === 3 ? `click ${menuItemRef(path.slice(0, 2))}
         delay 0.4` : ""}
         click ${leaf}
       end tell
     end tell
-    delay ${postdelay}
+    repeat ${Math.max(1, Math.round(postdelay / 0.25))} times
+      delay 0.25
+      if w is not missing value then
+        tell application "System Events"
+          if (count of sheets of w) > sheetsBefore then
+            delay 0.3
+            set s to sheet 1 of w
+            set msg to ""
+            try
+              set AppleScript's text item delimiters to " "
+              set msg to (value of every static text of s) as text
+              set AppleScript's text item delimiters to ""
+            end try
+            try
+              click (value of attribute "AXCancelButton" of s)
+            end try
+            return "SHEET" & (character id 30) & msg
+          end if
+        end tell
+      end if
+    end repeat
+    return ""
   `;
+    let stdout: string;
     try {
-      await execFileAsync("/usr/bin/osascript", ["-e", script], { timeout: 15_000 });
-      return;
+      ({ stdout } = await execFileAsync("/usr/bin/osascript", ["-e", script], { timeout: 15_000 + postdelay * 1000 }));
     } catch (err) {
       const e = err as { stderr?: string; message?: string; code?: number };
       const stderr = e.stderr || e.message || String(err);
       if (stderr.includes("DISABLED")) {
-        throw new Error(`Menu item ${menuPath.join(" > ")} (${path.join(" > ")}) is disabled: nothing it applies to is selected.`);
+        throw new Error(`Menu item ${menuPath.join(" > ")} (${path.join(" > ")}) is disabled for the current selection.`);
       }
       if (attempt === 0 && /\(-1728\)\s*$/.test(stderr.trim())) {
         forgetMenuPath(app, menuPath); // titles changed since they were cached
@@ -240,6 +270,62 @@ export async function clickMenuItem(
       }
       throw new OsascriptError(stderr, typeof e.code === "number" ? e.code : null);
     }
+    if (stdout.startsWith("SHEET\u001e")) {
+      const text = stdout.slice(6).trim();
+      throw new Error(`${resolveAppName(app)} answered ${menuPath.join(" > ")} with a dialog instead of doing it${text ? `: "${text}"` : ""}. The dialog was cancelled.`);
+    }
+    return;
+  }
+}
+
+/** AppleScript string literal. */
+export function asString(t: string): string {
+  return `"${t.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+/**
+ * Select one item of a document and bring its window to the front, so that a menu
+ * command applies to it. JXA can't set the selection on 15.x (`app.selection = [...]`
+ * fails with -1728, `doc.selection = [...]` with -1700), but AppleScript
+ * `set selection of document ... to {...}` works in all three apps. Menus act on the
+ * front window, so it is raised first. (Reading the selection back fails in Numbers.)
+ * `itemRef` is relative to the document, e.g. `image 2` or `image 1 of slide 3`;
+ * `prepare` runs first with the document as `d` (e.g. to show the item's slide).
+ */
+export async function selectForMenu(app: IWorkApp, documentName: string, itemRef: string, prepare = ""): Promise<void> {
+  const script = `
+on run argv
+  set docName to item 1 of argv
+  tell application "${resolveAppName(app)}"
+    activate
+    set d to missing value
+    repeat with nm in {docName, docName & "${EXT_MAP[app]}"}
+      if exists document (nm as text) then
+        set d to document (nm as text)
+        exit repeat
+      end if
+    end repeat
+    if d is missing value then error "Document not found: " & docName
+    set docId to id of d
+    repeat with w in windows
+      try
+        if id of document of w is docId then
+          set index of w to 1
+          exit repeat
+        end if
+      end try
+    end repeat
+    ${prepare}
+    delay 0.3
+    set selection of d to {${itemRef} of d}
+  end tell
+end run
+`;
+  try {
+    await execFileAsync("/usr/bin/osascript", ["-e", script, documentName], { timeout: 15_000 });
+  } catch (err) {
+    const e = err as { stderr?: string; message?: string; code?: number };
+    throw new OsascriptError(e.stderr || e.message || String(err), typeof e.code === "number" ? e.code : null);
   }
 }
 

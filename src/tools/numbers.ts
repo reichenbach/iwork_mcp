@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioExportPDF, saveTimeout, clickMenuItem, resolveAppName } from "../jxa.js";
+import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioExportPDF, saveTimeout, clickMenuItem, resolveAppName, selectForMenu, asString } from "../jxa.js";
 import { ANNOTATIONS } from "../annotations.js";
 
 function toolResult(text: string, isError = false) {
@@ -1831,17 +1831,17 @@ export function registerNumbersTools(server: McpServer): void {
         return toolResult("Super Resolution requires Apple Creator Studio (iWork 15.1+).", true);
       }
       return handleJXA(async () => {
-        // Select the image via JXA
-        await runJXA<void>(`
-          const app = Application("Numbers");
-          app.activate();
-          const doc = app.documents.byName(params.documentName);
+        const docName = await runJXA<string>(`
+          const doc = Application("Numbers").documents.byName(params.documentName);
           const sheet = params.sheetName ? doc.sheets.byName(params.sheetName) : doc.sheets[0];
           const images = sheet.images();
           if (params.imageIndex > images.length) throw new Error("Image index " + params.imageIndex + " out of range (sheet has " + images.length + " images)");
-          app.selection = [images[params.imageIndex - 1]];
+          return JSON.stringify(doc.name());
         `, { documentName, imageIndex, sheetName: sheetName ?? null },
-        { label: "super_resolution:select" });
+        { label: "super_resolution:check" });
+        // The image's sheet has to be the active one
+        const sheetRef = sheetName ? "sheet " + asString(sheetName) : "sheet 1";
+        await selectForMenu("Numbers", docName, "image " + imageIndex + " of " + sheetRef, "set active sheet of d to " + sheetRef + " of d");
 
         // Click Format > Image > Super Resolution
         await clickMenuItem("Numbers", ["Format", "Image", "Super Resolution"], { postdelay: 2 });
@@ -1865,17 +1865,17 @@ export function registerNumbersTools(server: McpServer): void {
         return toolResult("Remove Background requires Apple Creator Studio (iWork 15.1+).", true);
       }
       return handleJXA(async () => {
-        // Select the image via JXA
-        await runJXA<void>(`
-          const app = Application("Numbers");
-          app.activate();
-          const doc = app.documents.byName(params.documentName);
+        const docName = await runJXA<string>(`
+          const doc = Application("Numbers").documents.byName(params.documentName);
           const sheet = params.sheetName ? doc.sheets.byName(params.sheetName) : doc.sheets[0];
           const images = sheet.images();
           if (params.imageIndex > images.length) throw new Error("Image index " + params.imageIndex + " out of range (sheet has " + images.length + " images)");
-          app.selection = [images[params.imageIndex - 1]];
+          return JSON.stringify(doc.name());
         `, { documentName, imageIndex, sheetName: sheetName ?? null },
-        { label: "remove_background:select" });
+        { label: "remove_background:check" });
+        // The image's sheet has to be the active one
+        const sheetRef = sheetName ? "sheet " + asString(sheetName) : "sheet 1";
+        await selectForMenu("Numbers", docName, "image " + imageIndex + " of " + sheetRef, "set active sheet of d to " + sheetRef + " of d");
 
         // Click Format > Image > Remove Background
         await clickMenuItem("Numbers", ["Format", "Image", "Remove Background"], { postdelay: 2 });

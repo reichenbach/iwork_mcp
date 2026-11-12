@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioPagesExportPDF, saveTimeout, clickMenuItem, resolveAppName, pagesInsertTableViaUI, isDraftFile } from "../jxa.js";
+import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioPagesExportPDF, saveTimeout, clickMenuItem, resolveAppName, pagesInsertTableViaUI, isDraftFile, selectForMenu } from "../jxa.js";
 import { ANNOTATIONS } from "../annotations.js";
 
 function toolResult(text: string, isError = false) {
@@ -934,15 +934,14 @@ export function registerPagesTools(server: McpServer): void {
         return toolResult("Super Resolution requires Apple Creator Studio (iWork 15.1+).", true);
       }
       return handleJXA(async () => {
-        await runJXA<void>(`
-          const app = Application("Pages");
-          app.activate();
-          const doc = app.documents.byName(params.documentName);
+        const docName = await runJXA<string>(`
+          const doc = Application("Pages").documents.byName(params.documentName);
           const images = doc.images();
           if (params.imageIndex > images.length) throw new Error("Image index " + params.imageIndex + " out of range (document has " + images.length + " images)");
-          app.selection = [images[params.imageIndex - 1]];
+          return JSON.stringify(doc.name());
         `, { documentName, imageIndex },
-        { label: "super_resolution:select" });
+        { label: "super_resolution:check" });
+        await selectForMenu("Pages", docName, "image " + imageIndex);
 
         await clickMenuItem("Pages", ["Format", "Image", "Super Resolution"], { postdelay: 2 });
 
@@ -964,15 +963,14 @@ export function registerPagesTools(server: McpServer): void {
         return toolResult("Remove Background requires Apple Creator Studio (iWork 15.1+).", true);
       }
       return handleJXA(async () => {
-        await runJXA<void>(`
-          const app = Application("Pages");
-          app.activate();
-          const doc = app.documents.byName(params.documentName);
+        const docName = await runJXA<string>(`
+          const doc = Application("Pages").documents.byName(params.documentName);
           const images = doc.images();
           if (params.imageIndex > images.length) throw new Error("Image index " + params.imageIndex + " out of range (document has " + images.length + " images)");
-          app.selection = [images[params.imageIndex - 1]];
+          return JSON.stringify(doc.name());
         `, { documentName, imageIndex },
-        { label: "remove_background:select" });
+        { label: "remove_background:check" });
+        await selectForMenu("Pages", docName, "image " + imageIndex);
 
         await clickMenuItem("Pages", ["Format", "Image", "Remove Background"], { postdelay: 2 });
 
