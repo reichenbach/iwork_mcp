@@ -609,27 +609,45 @@ export async function creatorStudioSaveAs(
     { timeout, label: "creatorStudioSaveAs:close" },
   ).then(() => null, (err: unknown) => err);
 
-  // Wait for either the close to reply, or the file to be written and stable.
+  await waitForSave(closing, targetPath, start, true, `${appName} closed the document but did not write ${targetPath}`);
+
+  const reopened = await reopenDocument(appName, targetPath);
+  if (autoSave && autoSave !== targetPath) await trashUntitledAutoSave(appName, documentName, autoSave);
+  return reopened;
+}
+
+/**
+ * Wait for a save Apple Event to reply, or for its target file to be written (modified
+ * since `start`) and stable for 2s — Creator Studio apps sometimes write the file but
+ * never reply. `pending` resolves to null on success or to the error. If the reply fails,
+ * the save still counts when the file landed. With `requireWrite`, a successful reply
+ * without a written file is an error too (Save As must create the file; a plain save of
+ * an unmodified document may legitimately leave it untouched).
+ */
+async function waitForSave(
+  pending: Promise<unknown>,
+  path: string,
+  start: number,
+  requireWrite: boolean,
+  notWrittenMessage: string,
+): Promise<void> {
   let lastSig: string | null = null;
   let stableSince = 0;
   for (;;) {
-    const done = await Promise.race([closing, sleep(500).then(() => undefined)]);
+    const done = await Promise.race([pending, sleep(500).then(() => undefined)]);
     if (done !== undefined) {
-      if (await writtenSince(targetPath, start)) break; // a failed reply is fine if the file landed
-      throw done ?? new Error(`${appName} closed the document but did not write ${targetPath}`);
+      if (done === null && !requireWrite) return;
+      if (await writtenSince(path, start)) return; // a failed reply is fine if the file landed
+      throw done ?? new Error(notWrittenMessage);
     }
-    const sig = await writtenSince(targetPath, start);
+    const sig = await writtenSince(path, start);
     if (sig && sig === lastSig) {
-      if (Date.now() - stableSince >= 2_000) break;
+      if (Date.now() - stableSince >= 2_000) return;
     } else {
       lastSig = sig;
       stableSince = Date.now();
     }
   }
-
-  const reopened = await reopenDocument(appName, targetPath);
-  if (autoSave && autoSave !== targetPath) await trashUntitledAutoSave(appName, documentName, autoSave);
-  return reopened;
 }
 
 /** Open a saved file via LaunchServices and return its document name once the app has it. */
@@ -659,6 +677,82 @@ async function reopenDocument(appName: IWorkApp, targetPath: string): Promise<{ 
     // The file is saved; failing to reopen it must not turn the save into an error.
     return { name: fallbackName, reopened: false };
   }
+}
+
+const SAVE_TOOL: Record<IWorkApp, string> = {
+  Numbers: "numbers_save_document",
+  Pages: "pages_save_document",
+  Keynote: "keynote_save_presentation",
+};
+
+/** Error for a save-in-place request on a document that has never been saved to a file. */
+export function neverSavedError(appName: IWorkApp, documentName: string): string {
+  return `"${documentName}" has never been saved, so there is no file to save it to. ` +
+    `Call ${SAVE_TOOL[appName]} again with filePath (an absolute path ending in ${EXT_MAP[appName]}) to choose where to save it.`;
+}
+
+/** JXA script returning {name, path} of an open document; path is null if it has no file yet. */
+export function buildDocumentFileScript(appName: IWorkApp): string {
+  return `
+    const doc = Application("${appName}").documents.byName(params.documentName);
+    const file = doc.file();
+    return JSON.stringify({ name: doc.name(), path: file ? file.toString() : null });
+  `;
+}
+
+/**
+ * JXA script for a plain save (no path) of a document that already has a file.
+ * Creator Studio uses AppleScript `save document ...` via NSAppleScript (the scripting
+ * route known to work there); standard iWork uses JXA doc.save().
+ */
+export function buildSaveInPlaceScript(appName: IWorkApp, creatorStudio: boolean): string {
+  if (!creatorStudio) {
+    return `
+    Application("${appName}").documents.byName(params.documentName).save();
+  `;
+  }
+  return `
+    ObjC.import("Foundation");
+    const src = 'tell application "${appName}" to save document "' + params.documentName.replace(/\\\\/g, "\\\\\\\\").replace(/"/g, '\\\\"') + '"';
+    const err = $();
+    const result = $.NSAppleScript.alloc.initWithSource(src).executeAndReturnError(err);
+    if (!result || (result.isNil && result.isNil())) {
+      let info = {};
+      try { info = ObjC.deepUnwrap(err) || {}; } catch (e) {}
+      const msg = info.NSAppleScriptErrorBriefMessage || info.NSAppleScriptErrorMessage || "AppleScript save failed";
+      throw new Error(info.NSAppleScriptErrorNumber !== undefined ? msg + " (" + info.NSAppleScriptErrorNumber + ")" : msg);
+    }
+  `;
+}
+
+/**
+ * Save an open document to its existing file (plain Save, no path). Fails with a clear
+ * error — instead of reporting success — if the document has never been saved: it has
+ * no file, or its only file is an auto-saved draft (`com.apple.document.draft` xattr).
+ * On Creator Studio the app may write the file without replying, so the file is watched
+ * the same way as for Save As.
+ */
+export async function saveDocumentInPlace(appName: IWorkApp, documentName: string): Promise<{ name: string; path: string }> {
+  const creatorStudio = isCreatorStudio();
+  const { name, path } = await runJXA<{ name: string; path: string | null }>(
+    buildDocumentFileScript(appName), { documentName }, { label: `${appName.toLowerCase()}:save:file` },
+  );
+  // New and imported documents only have an auto-saved draft; saving one opens a Save sheet that blocks
+  if (!path || await isDraftFile(path)) throw new Error(neverSavedError(appName, name));
+
+  const start = Date.now();
+  const saving = runJXA<void>(
+    buildSaveInPlaceScript(appName, creatorStudio),
+    { documentName: name },
+    { timeout: saveTimeout(), label: `${appName.toLowerCase()}:save` },
+  ).then(() => null, (err: unknown) => err);
+  if (creatorStudio) {
+    await waitForSave(saving, path, start, false, `${appName} did not save ${path}`);
+  } else {
+    const err = await saving;
+    if (err) throw err;
+  }
+  return { name, path };
 }
 
 function sleep(ms: number): Promise<void> {

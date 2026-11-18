@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioKeynoteExportPDF, rememberCreatedDocument, saveTimeout, clickMenuItem, resolveAppName, selectForMenu, closeDocument } from "../jxa.js";
+import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, saveDocumentInPlace, creatorStudioKeynoteExportPDF, rememberCreatedDocument, saveTimeout, clickMenuItem, resolveAppName, selectForMenu, closeDocument } from "../jxa.js";
 import { ANNOTATIONS } from "../annotations.js";
 
 const execFileAsync = promisify(execFile);
@@ -284,34 +284,24 @@ export function registerKeynoteTools(server: McpServer): void {
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, filePath }) => handleJXA(async () => {
-      if (isCreatorStudio()) {
-        if (filePath) {
-          const { name, reopened } = await creatorStudioSaveAs("Keynote", documentName, filePath);
-          return JSON.stringify(reopened
-            ? { saved: true, name }
-            : { saved: true, name, reopened: false, note: `Saved, but Keynote did not reopen the file; open it with keynote_open_presentation if needed.` });
-        }
-        return runJXA<string>(`
-      ${KEYNOTE_AS_HELPERS}
-      const app = Application("Keynote");
-      const name = app.documents.byName(params.documentName).name();
-      runAS('tell application "Keynote" to save ' + docRef());
-      return JSON.stringify({ saved: true, name: name });
-    `, { documentName });
+      if (isCreatorStudio() && filePath) {
+        const { name, reopened } = await creatorStudioSaveAs("Keynote", documentName, filePath);
+        return JSON.stringify(reopened
+          ? { saved: true, name }
+          : { saved: true, name, reopened: false, note: `Saved, but Keynote did not reopen the file; open it with keynote_open_presentation if needed.` });
+      }
+      if (!filePath) {
+        const { name, path } = await saveDocumentInPlace("Keynote", documentName);
+        return JSON.stringify({ saved: true, name, path });
       }
       return runJXA<string>(`
       const app = Application("Keynote");
       const doc = app.documents.byName(params.documentName);
-      if (params.filePath) {
-        doc.save({ in: Path(params.filePath) });
-        doc.close({ saving: "no" });
-        const newDoc = app.open(Path(params.filePath));
-        return JSON.stringify({ saved: true, name: newDoc.name() });
-      } else {
-        doc.save();
-      }
-      return JSON.stringify({ saved: true, name: doc.name() });
-    `, { documentName, filePath: filePath ?? null }, { timeout: saveTimeout(), label: "keynote:save" });
+      doc.save({ in: Path(params.filePath) });
+      doc.close({ saving: "no" });
+      const newDoc = app.open(Path(params.filePath));
+      return JSON.stringify({ saved: true, name: newDoc.name() });
+    `, { documentName, filePath }, { timeout: saveTimeout(), label: "keynote:save" });
     }),
   );
 

@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioExportPDF, saveTimeout, clickMenuItem, resolveAppName, selectForMenu, asString, closeDocument } from "../jxa.js";
+import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, saveDocumentInPlace, creatorStudioExportPDF, saveTimeout, clickMenuItem, resolveAppName, selectForMenu, asString, closeDocument } from "../jxa.js";
 import { ANNOTATIONS } from "../annotations.js";
 
 function toolResult(text: string, isError = false) {
@@ -164,28 +164,24 @@ export function registerNumbersTools(server: McpServer): void {
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, filePath }) => handleJXA(async () => {
-      if (isCreatorStudio()) {
-        if (filePath) {
-          const { name, reopened } = await creatorStudioSaveAs("Numbers", documentName, filePath);
-          return JSON.stringify(reopened
-            ? { saved: true, name }
-            : { saved: true, name, reopened: false, note: `Saved, but Numbers did not reopen the file; open it with numbers_open_document if needed.` });
-        }
-        return JSON.stringify({ saved: true, name: documentName });
+      if (isCreatorStudio() && filePath) {
+        const { name, reopened } = await creatorStudioSaveAs("Numbers", documentName, filePath);
+        return JSON.stringify(reopened
+          ? { saved: true, name }
+          : { saved: true, name, reopened: false, note: `Saved, but Numbers did not reopen the file; open it with numbers_open_document if needed.` });
+      }
+      if (!filePath) {
+        const { name, path } = await saveDocumentInPlace("Numbers", documentName);
+        return JSON.stringify({ saved: true, name, path });
       }
       return runJXA<string>(`
       const app = Application("Numbers");
       const doc = app.documents.byName(params.documentName);
-      if (params.filePath) {
-        doc.save({ in: Path(params.filePath) });
-        doc.close({ saving: "no" });
-        const newDoc = app.open(Path(params.filePath));
-        return JSON.stringify({ saved: true, name: newDoc.name() });
-      } else {
-        doc.save();
-      }
-      return JSON.stringify({ saved: true, name: doc.name() });
-    `, { documentName, filePath: filePath ?? null }, { timeout: saveTimeout(), label: "numbers:save" });
+      doc.save({ in: Path(params.filePath) });
+      doc.close({ saving: "no" });
+      const newDoc = app.open(Path(params.filePath));
+      return JSON.stringify({ saved: true, name: newDoc.name() });
+    `, { documentName, filePath }, { timeout: saveTimeout(), label: "numbers:save" });
     }),
   );
 
