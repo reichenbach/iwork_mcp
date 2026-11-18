@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioExportPDF, saveTimeout, clickMenuItem, resolveAppName } from "../jxa.js";
+import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioExportPDF, saveTimeout, clickMenuItem, resolveAppName, selectForMenu, asString, closeDocument } from "../jxa.js";
 import { ANNOTATIONS } from "../annotations.js";
 
 function toolResult(text: string, isError = false) {
@@ -51,6 +51,48 @@ export function tableDimensions(
     columnCount: Math.max(MIN_TABLE_DIMENSION, dataCols),
   };
 }
+
+/** Size of the table a new blank Numbers document starts with. */
+export const DEFAULT_NEW_TABLE_SIZE = { rowCount: 22, columnCount: 7 } as const;
+
+/**
+ * Trim logic for numbers_write_table, as JavaScript source so the same code runs
+ * inside the JXA script and in the unit tests (via `new Function`). Plain ES5-ish
+ * JS on purpose: no TypeScript syntax, no imports.
+ *
+ * shouldTrimTable(trimToFit, rowCount, columnCount, values): whether to delete the
+ *   empty rows/columns past the written data. trimToFit true/false is the caller's
+ *   explicit choice. When it is left out, only an untouched default table is trimmed:
+ *   exactly 22x7 (the table a new blank document starts with) and every cell empty
+ *   before the write. Any other table keeps its size, so a table someone sized on
+ *   purpose (blank rows waiting for data, a template) is never shrunk by default.
+ *
+ * trimmedSize(values, rowCount, columnCount, needRows, needCols): the size after
+ *   trimming. values is the row-major cell values after the write. Only trailing
+ *   rows/columns that are completely empty are removed, never below the data
+ *   (needRows/needCols) and never below Numbers' 2x2 minimum.
+ */
+export const WRITE_TABLE_TRIM_JS = `
+  function isEmptyCell(v) { return v === null || v === undefined || v === ""; }
+  function shouldTrimTable(trimToFit, rowCount, columnCount, values) {
+    if (trimToFit === true) return true;
+    if (trimToFit === false) return false;
+    if (rowCount !== ${DEFAULT_NEW_TABLE_SIZE.rowCount} || columnCount !== ${DEFAULT_NEW_TABLE_SIZE.columnCount}) return false;
+    for (let i = 0; i < values.length; i++) if (!isEmptyCell(values[i])) return false;
+    return true;
+  }
+  function trimmedSize(values, rowCount, columnCount, needRows, needCols) {
+    const minRows = Math.max(needRows, ${MIN_TABLE_DIMENSION});
+    const minCols = Math.max(needCols, ${MIN_TABLE_DIMENSION});
+    const rowEmpty = (r) => { for (let c = 0; c < columnCount; c++) if (!isEmptyCell(values[r * columnCount + c])) return false; return true; };
+    let rows = rowCount;
+    while (rows > minRows && rowEmpty(rows - 1)) rows--;
+    const colEmpty = (c) => { for (let r = 0; r < rows; r++) if (!isEmptyCell(values[r * columnCount + c])) return false; return true; };
+    let cols = columnCount;
+    while (cols > minCols && colEmpty(cols - 1)) cols--;
+    return { rowCount: rows, columnCount: cols };
+  }
+`;
 
 export function registerNumbersTools(server: McpServer): void {
   // ── Document Management ──
@@ -178,23 +220,13 @@ export function registerNumbersTools(server: McpServer): void {
 
   server.tool(
     "numbers_close_document",
-    "Close a Numbers document",
+    "Close a Numbers document. With saving \"no\", a document that was never saved (new, or imported from another format) is discarded, including its iCloud draft (moved to the Trash). Such a document can't be closed with saving \"yes\": save it with a file path first.",
     {
       documentName: z.string().describe("Name of the open document"),
       saving: z.enum(["yes", "no", "ask"]).optional().describe("Whether to save before closing"),
     },
     ANNOTATIONS.destructive,
-    async ({ documentName, saving }) => handleJXA(() => runJXA<string>(`
-      const app = Application("Numbers");
-      const doc = app.documents.byName(params.documentName);
-      const saveOpts = { yes: "yes", no: "no", ask: "ask" };
-      if (params.saving) {
-        doc.close({ saving: saveOpts[params.saving] });
-      } else {
-        doc.close();
-      }
-      return JSON.stringify({ closed: true });
-    `, { documentName, saving: saving ?? null })),
+    async ({ documentName, saving }) => handleJXA(() => closeDocument("Numbers", documentName, saving)),
   );
 
   // ── Structure Tools ──
@@ -443,14 +475,15 @@ export function registerNumbersTools(server: McpServer): void {
 
   server.tool(
     "numbers_read_table",
-    "Read all data from a table as a 2D array. Returns rows of cell values.",
+    "Read all data from a table as a 2D array. Returns rows of cell values; empty rows/columns at the end are left out unless includeEmpty is set.",
     {
       documentName: z.string().describe("Name of the open document"),
       sheetName: z.string().optional().describe("Sheet name (defaults to first sheet)"),
       tableName: z.string().optional().describe("Table name (defaults to first table)"),
+      includeEmpty: z.boolean().optional().describe("Keep empty rows/columns at the end of the table (default: false)"),
     },
     ANNOTATIONS.readOnly,
-    async ({ documentName, sheetName, tableName }) => handleJXA(() => runJXA<string>(`
+    async ({ documentName, sheetName, tableName, includeEmpty }) => handleJXA(() => runJXA<string>(`
       const app = Application("Numbers");
       const doc = app.documents.byName(params.documentName);
       const sheet = params.sheetName ? doc.sheets.byName(params.sheetName) : doc.sheets[0];
@@ -459,12 +492,19 @@ export function registerNumbersTools(server: McpServer): void {
       const colCount = table.columnCount();
       // Batch read all cell values in one IPC call
       const allValues = table.cells.value();
-      const data = [];
+      let data = [];
       for (let r = 0; r < rowCount; r++) {
         data.push(allValues.slice(r * colCount, (r + 1) * colCount));
       }
+      if (!params.includeEmpty) {
+        const isEmpty = (v) => v === null || v === undefined || v === "";
+        while (data.length > 0 && data[data.length - 1].every(isEmpty)) data.pop();
+        let cols = colCount;
+        while (cols > 0 && data.every(row => isEmpty(row[cols - 1]))) cols--;
+        data = data.map(row => row.slice(0, cols));
+      }
       return JSON.stringify(data);
-    `, { documentName, sheetName: sheetName ?? null, tableName: tableName ?? null })),
+    `, { documentName, sheetName: sheetName ?? null, tableName: tableName ?? null, includeEmpty: includeEmpty ?? false })),
   );
 
   server.tool(
@@ -612,7 +652,7 @@ export function registerNumbersTools(server: McpServer): void {
 
   server.tool(
     "numbers_write_table",
-    "Bulk write an entire table of data in a single operation. Much faster than writing cells individually. Resizes the table to fit the data automatically.",
+    "Bulk write an entire table of data in a single operation. Much faster than writing cells individually. Grows the table to fit the data automatically. Never shrinks an existing table unless trimToFit is true; the only automatic trim is the untouched, empty 22x7 default table of a new document, which is cut down to the data.",
     {
       documentName: z.string().describe("Name of the open document"),
       data: z.array(z.array(z.union([z.string(), z.number(), z.boolean(), z.null()]))).min(1)
@@ -620,10 +660,12 @@ export function registerNumbersTools(server: McpServer): void {
       startCell: z.string().regex(/^[A-Z]{1,3}\d+$/).optional().describe("Top-left cell to start writing from (default: 'A1')"),
       sheetName: z.string().optional().describe("Sheet name (defaults to first sheet)"),
       tableName: z.string().optional().describe("Table name (defaults to first table)"),
-      resizeToFit: z.boolean().optional().describe("Resize table to fit data (default: true)"),
+      resizeToFit: z.boolean().optional().describe("Add rows/columns when the data does not fit (default: true)"),
+      trimToFit: z.boolean().optional().describe("Delete completely empty rows/columns past the data afterwards. true: always; false: never; omitted: only when the table is the untouched, empty 22x7 default table of a new document. Rows/columns holding any value are never deleted."),
     },
     ANNOTATIONS.readWrite,
-    async ({ documentName, data, startCell, sheetName, tableName, resizeToFit }) => handleJXA(() => runJXA<string>(`
+    async ({ documentName, data, startCell, sheetName, tableName, resizeToFit, trimToFit }) => handleJXA(() => runJXA<string>(`
+      ${WRITE_TABLE_TRIM_JS}
       const app = Application("Numbers");
       const doc = app.documents.byName(params.documentName);
       const sheet = params.sheetName ? doc.sheets.byName(params.sheetName) : doc.sheets[0];
@@ -647,6 +689,10 @@ export function registerNumbersTools(server: McpServer): void {
       const needRows = startRow + dataRows;
       const needCols = startCol + dataCols;
 
+      // Decide before writing: the default-table check looks at the table as it was.
+      const trim = shouldTrimTable(params.trimToFit, table.rowCount(), table.columnCount(),
+        params.trimToFit === undefined || params.trimToFit === null ? table.cells.value() : []);
+
       // Resize table if needed
       if (params.resizeToFit !== false) {
         while (table.rowCount() < needRows) {
@@ -668,8 +714,20 @@ export function registerNumbersTools(server: McpServer): void {
           }
         }
       }
-      return JSON.stringify({ cellsWritten: cellsWritten, rows: dataRows, columns: dataCols });
-    `, { documentName, data, startCell: startCell ?? null, sheetName: sheetName ?? null, tableName: tableName ?? null, resizeToFit: resizeToFit ?? true })),
+
+      // Drop trailing empty rows/columns past the data (see WRITE_TABLE_TRIM_JS for when)
+      let trimmed = false;
+      if (trim) {
+        const rowCount = table.rowCount(), columnCount = table.columnCount();
+        const size = trimmedSize(table.cells.value(), rowCount, columnCount, needRows, needCols);
+        try {
+          for (let r = rowCount - 1; r >= size.rowCount; r--) app.delete(table.rows[r]);
+          for (let c = columnCount - 1; c >= size.columnCount; c--) app.delete(table.columns[c]);
+          trimmed = true;
+        } catch (e) {}
+      }
+      return JSON.stringify({ cellsWritten: cellsWritten, rows: dataRows, columns: dataCols, tableRows: table.rowCount(), tableColumns: table.columnCount(), trimmed: trimmed });
+    `, { documentName, data, startCell: startCell ?? null, sheetName: sheetName ?? null, tableName: tableName ?? null, resizeToFit: resizeToFit ?? true, trimToFit: trimToFit ?? null })),
   );
 
   server.tool(
@@ -1756,14 +1814,17 @@ export function registerNumbersTools(server: McpServer): void {
         { label: "magic_fill:enter_table" });
 
         // 3. Click "Magic Fill Cells" (or "Magic Fill Cell" for single cell)
-        try {
-          await clickMenuItem("Numbers", ["Table", "Magic Fill Cells"]);
-        } catch {
+        // The title depends on the version and the selection ("Magic Fill" in 15.4)
+        let filled = false;
+        for (const title of ["Magic Fill Cells", "Magic Fill Cell", "Magic Fill"]) {
           try {
-            await clickMenuItem("Numbers", ["Table", "Magic Fill Cell"]);
-          } catch {
-            throw new Error("Magic Fill is not available. Ensure the selected range is adjacent to rows with example values that show a recognizable pattern.");
-          }
+            await clickMenuItem("Numbers", ["Table", title]);
+            filled = true;
+            break;
+          } catch {}
+        }
+        if (!filled) {
+          throw new Error("Magic Fill is not available. Ensure the selected range is adjacent to rows with example values that show a recognizable pattern.");
         }
 
         // 4. Wait for AI to process suggestions and accept with Return
@@ -1806,17 +1867,17 @@ export function registerNumbersTools(server: McpServer): void {
         return toolResult("Super Resolution requires Apple Creator Studio (iWork 15.1+).", true);
       }
       return handleJXA(async () => {
-        // Select the image via JXA
-        await runJXA<void>(`
-          const app = Application("Numbers");
-          app.activate();
-          const doc = app.documents.byName(params.documentName);
+        const docName = await runJXA<string>(`
+          const doc = Application("Numbers").documents.byName(params.documentName);
           const sheet = params.sheetName ? doc.sheets.byName(params.sheetName) : doc.sheets[0];
           const images = sheet.images();
           if (params.imageIndex > images.length) throw new Error("Image index " + params.imageIndex + " out of range (sheet has " + images.length + " images)");
-          app.selection = [images[params.imageIndex - 1]];
+          return JSON.stringify(doc.name());
         `, { documentName, imageIndex, sheetName: sheetName ?? null },
-        { label: "super_resolution:select" });
+        { label: "super_resolution:check" });
+        // The image's sheet has to be the active one
+        const sheetRef = sheetName ? "sheet " + asString(sheetName) : "sheet 1";
+        await selectForMenu("Numbers", docName, "image " + imageIndex + " of " + sheetRef, "set active sheet of d to " + sheetRef + " of d");
 
         // Click Format > Image > Super Resolution
         await clickMenuItem("Numbers", ["Format", "Image", "Super Resolution"], { postdelay: 2 });
@@ -1840,17 +1901,17 @@ export function registerNumbersTools(server: McpServer): void {
         return toolResult("Remove Background requires Apple Creator Studio (iWork 15.1+).", true);
       }
       return handleJXA(async () => {
-        // Select the image via JXA
-        await runJXA<void>(`
-          const app = Application("Numbers");
-          app.activate();
-          const doc = app.documents.byName(params.documentName);
+        const docName = await runJXA<string>(`
+          const doc = Application("Numbers").documents.byName(params.documentName);
           const sheet = params.sheetName ? doc.sheets.byName(params.sheetName) : doc.sheets[0];
           const images = sheet.images();
           if (params.imageIndex > images.length) throw new Error("Image index " + params.imageIndex + " out of range (sheet has " + images.length + " images)");
-          app.selection = [images[params.imageIndex - 1]];
+          return JSON.stringify(doc.name());
         `, { documentName, imageIndex, sheetName: sheetName ?? null },
-        { label: "remove_background:select" });
+        { label: "remove_background:check" });
+        // The image's sheet has to be the active one
+        const sheetRef = sheetName ? "sheet " + asString(sheetName) : "sheet 1";
+        await selectForMenu("Numbers", docName, "image " + imageIndex + " of " + sheetRef, "set active sheet of d to " + sheetRef + " of d");
 
         // Click Format > Image > Remove Background
         await clickMenuItem("Numbers", ["Format", "Image", "Remove Background"], { postdelay: 2 });
