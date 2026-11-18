@@ -34,6 +34,45 @@ async function handleJXA<T>(fn: () => Promise<T>): Promise<{ content: { type: "t
   }
 }
 
+/**
+ * Position helpers for the Pages text tools, as JavaScript source so the same code
+ * runs inside the JXA scripts (via BODY_EDIT_HELPERS) and in the unit tests (via
+ * `new Function`). Plain JS: no TypeScript syntax, no imports, no JXA calls.
+ *
+ * paraBounds(text): one entry per paragraph, matching doc.bodyText.paragraphs: its
+ *   characters are text.slice(start, end), and sep ("\\n", "\\f" or "" for the last)
+ *   sits at end. text may be a string or an array of characters.
+ * findCharPositions(text, find, all): start positions of the non-overlapping matches
+ *   of find in text, in code points (like doc.bodyText.characters), not UTF-16 units.
+ */
+export const BODY_TEXT_POSITION_JS = `
+    function paraBounds(text) {
+      const paras = [];
+      let start = 0;
+      for (let i = 0; i < text.length; i++) {
+        if (text[i] === "\\n" || text[i] === "\\f") {
+          paras.push({ start: start, end: i, sep: text[i] });
+          start = i + 1;
+        }
+      }
+      paras.push({ start: start, end: text.length, sep: "" });
+      return paras;
+    }
+    function findCharPositions(text, find, all) {
+      const hits = [];
+      const findLength = Array.from(find).length;
+      let from = 0, pos = 0, idx;
+      while ((idx = text.indexOf(find, from)) !== -1) {
+        pos += Array.from(text.slice(from, idx)).length;
+        hits.push(pos);
+        pos += findLength;
+        from = idx + find.length;
+        if (!all) break;
+      }
+      return hits;
+    }
+`;
+
 export function registerPagesTools(server: McpServer): void {
   // The text tools edit the body in place. Setting doc.bodyText (or a whole paragraph)
   // resets the formatting of everything it covers, character styles and paragraph
@@ -71,20 +110,7 @@ export function registerPagesTools(server: McpServer): void {
         throw new Error("Pages did not apply the change to the body text. Its window may be in the middle of an edit: click into the document, or close and reopen it, and try again.");
       }
     }
-    // One entry per paragraph, matching doc.bodyText.paragraphs: its characters are
-    // text.slice(start, end), and sep ("\\n", "\\f" or "" for the last) sits at end.
-    function paraBounds(text) {
-      const paras = [];
-      let start = 0;
-      for (let i = 0; i < text.length; i++) {
-        if (text[i] === "\\n" || text[i] === "\\f") {
-          paras.push({ start: start, end: i, sep: text[i] });
-          start = i + 1;
-        }
-      }
-      paras.push({ start: start, end: text.length, sep: "" });
-      return paras;
-    }
+    ${BODY_TEXT_POSITION_JS}
     function setChar(doc, index, s) {
       doc.bodyText.characters[index] = s;
       Array.prototype.splice.apply(expectedBody, [index, 1].concat(Array.from(s)));
@@ -477,16 +503,7 @@ export function registerPagesTools(server: McpServer): void {
       const text = bodyChars(doc).join("");
       const findLength = Array.from(params.find).length;
       const replaceLength = Array.from(params.replace).length;
-      // Character positions of the matches (code points, like doc.bodyText.characters)
-      const hits = [];
-      let from = 0, pos = 0, idx;
-      while ((idx = text.indexOf(params.find, from)) !== -1) {
-        pos += Array.from(text.slice(from, idx)).length;
-        hits.push(pos);
-        pos += findLength;
-        from = idx + params.find.length;
-        if (params.all === false) break;
-      }
+      const hits = findCharPositions(text, params.find, params.all !== false);
       // From the last match back, so the positions before it stay valid
       for (let h = hits.length - 1; h >= 0; h--) {
         const k = hits[h];

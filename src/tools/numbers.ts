@@ -52,6 +52,48 @@ export function tableDimensions(
   };
 }
 
+/** Size of the table a new blank Numbers document starts with. */
+export const DEFAULT_NEW_TABLE_SIZE = { rowCount: 22, columnCount: 7 } as const;
+
+/**
+ * Trim logic for numbers_write_table, as JavaScript source so the same code runs
+ * inside the JXA script and in the unit tests (via `new Function`). Plain ES5-ish
+ * JS on purpose: no TypeScript syntax, no imports.
+ *
+ * shouldTrimTable(trimToFit, rowCount, columnCount, values): whether to delete the
+ *   empty rows/columns past the written data. trimToFit true/false is the caller's
+ *   explicit choice. When it is left out, only an untouched default table is trimmed:
+ *   exactly 22x7 (the table a new blank document starts with) and every cell empty
+ *   before the write. Any other table keeps its size, so a table someone sized on
+ *   purpose (blank rows waiting for data, a template) is never shrunk by default.
+ *
+ * trimmedSize(values, rowCount, columnCount, needRows, needCols): the size after
+ *   trimming. values is the row-major cell values after the write. Only trailing
+ *   rows/columns that are completely empty are removed, never below the data
+ *   (needRows/needCols) and never below Numbers' 2x2 minimum.
+ */
+export const WRITE_TABLE_TRIM_JS = `
+  function isEmptyCell(v) { return v === null || v === undefined || v === ""; }
+  function shouldTrimTable(trimToFit, rowCount, columnCount, values) {
+    if (trimToFit === true) return true;
+    if (trimToFit === false) return false;
+    if (rowCount !== ${DEFAULT_NEW_TABLE_SIZE.rowCount} || columnCount !== ${DEFAULT_NEW_TABLE_SIZE.columnCount}) return false;
+    for (let i = 0; i < values.length; i++) if (!isEmptyCell(values[i])) return false;
+    return true;
+  }
+  function trimmedSize(values, rowCount, columnCount, needRows, needCols) {
+    const minRows = Math.max(needRows, ${MIN_TABLE_DIMENSION});
+    const minCols = Math.max(needCols, ${MIN_TABLE_DIMENSION});
+    const rowEmpty = (r) => { for (let c = 0; c < columnCount; c++) if (!isEmptyCell(values[r * columnCount + c])) return false; return true; };
+    let rows = rowCount;
+    while (rows > minRows && rowEmpty(rows - 1)) rows--;
+    const colEmpty = (c) => { for (let r = 0; r < rows; r++) if (!isEmptyCell(values[r * columnCount + c])) return false; return true; };
+    let cols = columnCount;
+    while (cols > minCols && colEmpty(cols - 1)) cols--;
+    return { rowCount: rows, columnCount: cols };
+  }
+`;
+
 export function registerNumbersTools(server: McpServer): void {
   // ── Document Management ──
 
@@ -610,7 +652,7 @@ export function registerNumbersTools(server: McpServer): void {
 
   server.tool(
     "numbers_write_table",
-    "Bulk write an entire table of data in a single operation. Much faster than writing cells individually. Resizes the table to fit the data automatically, including removing empty rows/columns past the data.",
+    "Bulk write an entire table of data in a single operation. Much faster than writing cells individually. Grows the table to fit the data automatically. Never shrinks an existing table unless trimToFit is true; the only automatic trim is the untouched, empty 22x7 default table of a new document, which is cut down to the data.",
     {
       documentName: z.string().describe("Name of the open document"),
       data: z.array(z.array(z.union([z.string(), z.number(), z.boolean(), z.null()]))).min(1)
@@ -618,10 +660,12 @@ export function registerNumbersTools(server: McpServer): void {
       startCell: z.string().regex(/^[A-Z]{1,3}\d+$/).optional().describe("Top-left cell to start writing from (default: 'A1')"),
       sheetName: z.string().optional().describe("Sheet name (defaults to first sheet)"),
       tableName: z.string().optional().describe("Table name (defaults to first table)"),
-      resizeToFit: z.boolean().optional().describe("Resize table to fit data: add missing rows/columns and remove empty ones past the data (default: true)"),
+      resizeToFit: z.boolean().optional().describe("Add rows/columns when the data does not fit (default: true)"),
+      trimToFit: z.boolean().optional().describe("Delete completely empty rows/columns past the data afterwards. true: always; false: never; omitted: only when the table is the untouched, empty 22x7 default table of a new document. Rows/columns holding any value are never deleted."),
     },
     ANNOTATIONS.readWrite,
-    async ({ documentName, data, startCell, sheetName, tableName, resizeToFit }) => handleJXA(() => runJXA<string>(`
+    async ({ documentName, data, startCell, sheetName, tableName, resizeToFit, trimToFit }) => handleJXA(() => runJXA<string>(`
+      ${WRITE_TABLE_TRIM_JS}
       const app = Application("Numbers");
       const doc = app.documents.byName(params.documentName);
       const sheet = params.sheetName ? doc.sheets.byName(params.sheetName) : doc.sheets[0];
@@ -645,6 +689,10 @@ export function registerNumbersTools(server: McpServer): void {
       const needRows = startRow + dataRows;
       const needCols = startCol + dataCols;
 
+      // Decide before writing: the default-table check looks at the table as it was.
+      const trim = shouldTrimTable(params.trimToFit, table.rowCount(), table.columnCount(),
+        params.trimToFit === undefined || params.trimToFit === null ? table.cells.value() : []);
+
       // Resize table if needed
       if (params.resizeToFit !== false) {
         while (table.rowCount() < needRows) {
@@ -667,21 +715,19 @@ export function registerNumbersTools(server: McpServer): void {
         }
       }
 
-      // Also drop trailing rows/columns past the data if they are empty (e.g. the 22x7 default table)
-      if (params.resizeToFit !== false) {
-        const values = table.cells.value();
-        const cols = table.columnCount();
-        const isEmpty = (v) => v === null || v === undefined || v === "";
-        const rowEmpty = (r) => { for (let c = 0; c < cols; c++) if (!isEmpty(values[r * cols + c])) return false; return true; };
-        const colEmpty = (c, rows) => { for (let r = 0; r < rows; r++) if (!isEmpty(values[r * cols + c])) return false; return true; };
+      // Drop trailing empty rows/columns past the data (see WRITE_TABLE_TRIM_JS for when)
+      let trimmed = false;
+      if (trim) {
+        const rowCount = table.rowCount(), columnCount = table.columnCount();
+        const size = trimmedSize(table.cells.value(), rowCount, columnCount, needRows, needCols);
         try {
-          for (let r = table.rowCount() - 1; r >= Math.max(needRows, 2) && rowEmpty(r); r--) app.delete(table.rows[r]);
-          const rows = table.rowCount();
-          for (let c = table.columnCount() - 1; c >= Math.max(needCols, 2) && colEmpty(c, rows); c--) app.delete(table.columns[c]);
+          for (let r = rowCount - 1; r >= size.rowCount; r--) app.delete(table.rows[r]);
+          for (let c = columnCount - 1; c >= size.columnCount; c--) app.delete(table.columns[c]);
+          trimmed = true;
         } catch (e) {}
       }
-      return JSON.stringify({ cellsWritten: cellsWritten, rows: dataRows, columns: dataCols, tableRows: table.rowCount(), tableColumns: table.columnCount() });
-    `, { documentName, data, startCell: startCell ?? null, sheetName: sheetName ?? null, tableName: tableName ?? null, resizeToFit: resizeToFit ?? true })),
+      return JSON.stringify({ cellsWritten: cellsWritten, rows: dataRows, columns: dataCols, tableRows: table.rowCount(), tableColumns: table.columnCount(), trimmed: trimmed });
+    `, { documentName, data, startCell: startCell ?? null, sheetName: sheetName ?? null, tableName: tableName ?? null, resizeToFit: resizeToFit ?? true, trimToFit: trimToFit ?? null })),
   );
 
   server.tool(
