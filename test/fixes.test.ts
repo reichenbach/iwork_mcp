@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import {
   envTimeout, jxaTimeout, saveTimeout, runJXA,
   DEFAULT_JXA_TIMEOUT_MS, DEFAULT_SAVE_TIMEOUT_MS,
+  buildDocumentFileScript, buildSaveInPlaceScript, neverSavedError,
 } from "../src/jxa.js";
 import { tableDimensions } from "../src/tools/numbers.js";
 import { createTestServer, type TestContext } from "./helpers/server.js";
@@ -107,4 +108,69 @@ describe("pages_add_image input validation", () => {
     assert.equal(result.isError, true);
     assert.match(text, /Image file not found/);
   });
+});
+
+// Runs a save script against stubbed JXA globals, recording what it would save.
+function runSaveScript(script: string, doc: { name: string; file: string | null }) {
+  const calls = { jxaSave: 0, appleScript: [] as string[] };
+  const fakeDoc = {
+    name: () => doc.name,
+    file: () => (doc.file ? { toString: () => doc.file } : null),
+    save: () => { calls.jxaSave++; },
+  };
+  const Application = () => ({ documents: { byName: () => fakeDoc } });
+  const $ = Object.assign(() => ({}), {
+    NSAppleScript: { alloc: { initWithSource: (src: string) => {
+      calls.appleScript.push(src);
+      return { executeAndReturnError: () => ({ isNil: () => false }) };
+    } } },
+  });
+  const ObjC = { import: () => {}, deepUnwrap: () => ({}) };
+  const out = new Function("params", "Application", "$", "ObjC", script)({ documentName: doc.name }, Application, $, ObjC);
+  return { result: out === undefined ? undefined : JSON.parse(out), calls };
+}
+
+describe("save without a path (numbers/pages/keynote save tools)", () => {
+  const apps = ["Numbers", "Pages", "Keynote"] as const;
+
+  it("never-saved error names the document and asks for filePath", () => {
+    const cases = { Numbers: ["numbers_save_document", ".numbers"], Pages: ["pages_save_document", ".pages"], Keynote: ["keynote_save_presentation", ".key"] };
+    for (const app of apps) {
+      const msg = neverSavedError(app, "Untitled 3");
+      assert.match(msg, /"Untitled 3" has never been saved/);
+      assert.ok(msg.includes(cases[app][0]), msg);
+      assert.ok(msg.includes("filePath"), msg);
+      assert.ok(msg.includes(cases[app][1]), msg);
+    }
+  });
+
+  for (const app of apps) {
+    it(`${app}: file lookup reports the document's path, or null if it has never been saved`, () => {
+      const saved = runSaveScript(buildDocumentFileScript(app), { name: "Budget", file: "/tmp/x/Budget" });
+      assert.deepEqual(saved.result, { name: "Budget", path: "/tmp/x/Budget" });
+      const unsaved = runSaveScript(buildDocumentFileScript(app), { name: "Untitled 4", file: null });
+      assert.deepEqual(unsaved.result, { name: "Untitled 4", path: null });
+      for (const r of [saved, unsaved]) {
+        assert.equal(r.calls.jxaSave, 0, "the lookup must not save");
+        assert.equal(r.calls.appleScript.length, 0, "the lookup must not save");
+      }
+    });
+
+    it(`${app} (Creator Studio): saves via AppleScript save document, not JXA save`, () => {
+      const { calls } = runSaveScript(buildSaveInPlaceScript(app, true), { name: "Budget", file: "/tmp/x/Budget" });
+      assert.equal(calls.jxaSave, 0);
+      assert.deepEqual(calls.appleScript, [`tell application "${app}" to save document "Budget"`]);
+    });
+
+    it(`${app} (standard): saves via JXA doc.save()`, () => {
+      const { calls } = runSaveScript(buildSaveInPlaceScript(app, false), { name: "Budget", file: "/tmp/x/Budget" });
+      assert.equal(calls.jxaSave, 1);
+      assert.equal(calls.appleScript.length, 0);
+    });
+
+    it(`${app}: quotes document names in the AppleScript save`, () => {
+      const { calls } = runSaveScript(buildSaveInPlaceScript(app, true), { name: 'Q1 "final" \\ v2', file: "/tmp/q" });
+      assert.deepEqual(calls.appleScript, [`tell application "${app}" to save document "Q1 \\"final\\" \\\\ v2"`]);
+    });
+  }
 });
